@@ -43,8 +43,6 @@ CFLAGS  += -g -O0
 # the scanner.h header file.
 #CFLAGS += -I /path/to/scanner/sources
 
-CFLAGS += -I ../memory/
-
 # The scanner uses some header files that are part of
 # the binutils sources, but which are not normally
 # distributed with binary packages.  (eg elf/internal.h)
@@ -97,7 +95,7 @@ AARCH64_LDFLAGS += -L /path/to/gdb/build/libiberty
 
 # ---- You should not need to modify anything below here --------------
 
-HEADERS  = scanner.h ../memory/memory.hpp
+HEADERS  = scanner.h memory.hpp
 
 # The AArch64 scanner has overrides for some of the AArch64
 # simulator's memory and register access functions.
@@ -141,7 +139,7 @@ test.obj: test
 test: test.c
 	$(C++) $< $(CFLAGS_TEST) -o test
 
-memory.o: ../memory/memory.cpp $(HEADERS)
+memory.o: memory.cpp $(HEADERS)
 	$(C++) -c $< $(CFLAGS)
 
 scanner.o: scanner.c $(HEADERS)
