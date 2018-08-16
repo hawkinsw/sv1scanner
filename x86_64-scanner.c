@@ -14,9 +14,11 @@
 
 #include "scanner.h"
 
-extern int print_insn_i386 (bfd_vma, disassemble_info *);
-extern int print_insn_i386_intel (bfd_vma, disassemble_info *);
-extern int print_insn_i386_att (bfd_vma, disassemble_info *);
+extern "C" {
+int print_insn_i386 (bfd_vma, disassemble_info *);
+int print_insn_i386_intel (bfd_vma, disassemble_info *);
+int print_insn_i386_att (bfd_vma, disassemble_info *);
+}
 
 /* Number of bytes on the stack.  */
 #define STACK_SIZE     256
@@ -105,6 +107,7 @@ typedef enum arg_type
   type_register,
   type_constant,
   type_address,
+  type_register_address,
 } arg_type;
 
 typedef struct arg
@@ -596,6 +599,7 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
       if (*text == '%')
 	{
 	  text++;
+	  arg->type = type_register_address;
 	  arg->value = parse_reg (ss, & text, lval);
 	}
       if (*text == ',')
@@ -704,6 +708,7 @@ parse_arg (scan_state * ss, const char * text, const char ** end, arg * arg, boo
     case '-':
     case '0': /* Register offset addressing ?  */
     case '(': /* Register relative addressing ? */
+      einfo(VERBOSE2, "Doing some type of memory reading for parse_arg.");
       ret = parse_mem_arg (ss, text - 1, & text, arg, lval);
       break;
 
@@ -904,7 +909,7 @@ add_reg_move (scan_state * ss, int in_reg, int out_reg)
   if (ss->n_moves == ss->next_move)
     {
       ss->n_moves += 20;
-      ss->moves = xrealloc (ss->moves, ss->n_moves * sizeof (* ss->moves));
+      ss->moves = (reg_move*) xrealloc (ss->moves, ss->n_moves * sizeof (* ss->moves));
     }
 
   ss->moves[ss->next_move].tick   = ss->tick;
@@ -919,6 +924,7 @@ add_move (scan_state * ss, arg * input, arg * output)
   int in_reg = reg_from_arg (input);
   int out_reg = reg_from_arg (output);
 
+  einfo(VERBOSE2, "Moving from %d to %d", in_reg, out_reg);
   add_reg_move (ss, in_reg, out_reg);
 }
 
@@ -936,11 +942,12 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
     case sc_mov_zext:
     case sc_mov_sext:
     case sc_mov_mov:
-      if (arg2.type == type_register)
+      if (arg2.type == type_register || arg2.type == type_register_address)
 	{
 	  switch (arg1.type)
 	    {
 	    case type_register:
+	    case type_register_address:
 	      SET_REG_FROM_ARG (ss, arg2, GET_REG_FROM_ARG (ss, arg1));
 	      break;
 	    case type_address:
@@ -952,6 +959,10 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	    default:
 	      return handler_error (ss, "unhandled MOV");
 	    }
+	}
+      else
+	{
+	  einfo(VERBOSE2, "Not handling move to non-register relative memory.");
 	}
       break;
 
@@ -1420,6 +1431,7 @@ static insn_info c_insns [] =
   FLOW_OP ("callw", FALSE, sc_flow_call),
   FAULT_OP ("cld"), 		/* FIXME: Implement.  */
   FAULT_OP ("cli"),
+  IGNORE_OP ("cltq"),
   /* FIXME: We currently assume that conditional moves always takes place.  */
   MOV_OP ("cmova"),
   MOV_OP ("cmovae"),
@@ -1728,6 +1740,7 @@ x86_classify_insn (ulong pc, addr_info * info)
   disas.pos = 0;
   disas.buffer[0] = 0;
   emul_info.status = TRUE;
+  /* This actually does the instruction disassembly. */
   info->len = print_insn_i386 (pc, & disas.info);
   if (info->len < 1)
     return 1;
@@ -1778,6 +1791,13 @@ x86_classify_insn (ulong pc, addr_info * info)
       return info->len;
     }
 
+  /*
+     insn_lists is a 26-element array - one for each letter
+     of the alphabet. Index using the first letter of
+     the instruction. There are some letters that never start
+     an instruction so we have to check for null before
+     starting.
+   */
   insns = insn_lists[TOLOWER (*t) - 'a'];
   if (insns != NULL)
     {
@@ -1900,7 +1920,7 @@ x86_init (bfd_byte * code, ulong size, ulong start, const char * filename, ulong
 
       disas.alloc  = 128;
       disas.pos    = 0;
-      disas.buffer = xmalloc (disas.alloc);
+      disas.buffer = (char*) xmalloc (disas.alloc);
 
       /* Initialise the non-NULL fields in the disassembler info structure.  */
       init_disassemble_info (& disas.info, stdout, x86_printf);
@@ -1923,7 +1943,7 @@ x86_init (bfd_byte * code, ulong size, ulong start, const char * filename, ulong
   emul_info.size = size;
   emul_info.code_base = start;
   emul_info.status = TRUE;
-  emul_info.scanned = xmalloc (size * sizeof * emul_info.scanned);
+  emul_info.scanned = (addr_info*) xmalloc (size * sizeof * emul_info.scanned);
   return TRUE;
 }
 
@@ -2077,8 +2097,18 @@ x86_preevaluate (ulong start, ulong end)
   suppress_checks = TRUE;
   for (addr = start; addr < end ; addr += len)
     {
+      /*
+	 Put the instruction information directly into the
+	 array of information that we are storing, one for
+	 each of the instructions in the program.
+       */
       addr_info *start_info = emul_info.scanned + (addr - start);
-
+      /*
+	 This basically does the disassembly of the instruction. 
+	 The output (len) is the length of the disassembled
+	 instruction. start_info->insn has the disassembled 
+	 instruction as a result.
+       */
       len = x86_classify_insn (addr, start_info);
 
       start_info->n_arith_insns = 0;
@@ -2185,7 +2215,7 @@ get_branch_dest (ulong addr)
 static scan_state *
 clone_state (scan_state * old_state, ulong new_pc)
 {
-  scan_state * new_state = xmalloc (sizeof * new_state);
+  scan_state * new_state = (scan_state *)xmalloc (sizeof * new_state);
 
   if (old_state)
     memcpy (new_state, old_state, sizeof (* old_state));
@@ -2195,19 +2225,19 @@ clone_state (scan_state * old_state, ulong new_pc)
       new_state->conditional_tick = -1;
     }
   
-  new_state->insns = xmalloc (max_num_ticks * sizeof (* new_state->insns));
+  new_state->insns = (ulong*) xmalloc (max_num_ticks * sizeof (* new_state->insns));
 
   if (old_state)
     {
       memcpy (new_state->insns, old_state->insns, max_num_ticks * sizeof (* new_state->insns));
-      new_state->moves = xmalloc (old_state->n_moves * sizeof (* new_state->moves));
+      new_state->moves = (reg_move*) xmalloc (old_state->n_moves * sizeof (* new_state->moves));
       memcpy (new_state->moves, old_state->moves, old_state->next_move * sizeof (* old_state->moves));
     }
   else
     {
       new_state->n_moves   = 20;
       new_state->next_move = 0;
-      new_state->moves     = xmalloc (20 * sizeof (* new_state->moves));
+      new_state->moves     = (reg_move*) xmalloc (20 * sizeof (* new_state->moves));
     }
 
   new_state->pc = new_pc;
@@ -2247,7 +2277,7 @@ run_scan (scan_state * ss, ulong start, ulong end)
 
       this_pc = ss->pc;
 
-      display_insn (VERBOSE2, this_pc, "");
+      display_insn (VERBOSE2, this_pc, "this_pc: ");
 
       if (this_pc < start || this_pc >= end)
 	{
@@ -2262,7 +2292,10 @@ run_scan (scan_state * ss, ulong start, ulong end)
       /* Stop on bad instructions.  */
       if (this_addr == NULL
 	  || this_addr->insn == NULL)
-	break;
+	{
+	  einfo(FAIL, "Bad instruction at 0x%lx", this_pc);
+	  break;
+	}
       
       if (is_breakpoint (this_addr->insn))
 	{
@@ -2302,6 +2335,9 @@ run_scan (scan_state * ss, ulong start, ulong end)
 
 	  next = get_branch_dest (this_pc);
 
+	  /*
+	     First, go down the path of taking the branch.
+	   */
 	  if (next >= start && next < end)
 	    {
 	      scan_state * new_state;
@@ -2323,11 +2359,21 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	  else
 	    einfo (VERBOSE, "branch out of range ? (dest = %lx)", next);
 
+	  /*
+	     Simulate down the path of having not taken the branch.
+	     Because we are only here after unwinding all the recursive
+	     calls to run_scan, this will be done after all the 
+	     simulation of the taken branch is complete.
+	   */
 	  ss->pc += this_addr->len;
 	  einfo (VERBOSE2, "assuming branch not followed, so next pc is %lx", ss->pc);
 	  if (ss->pc >= end)
 	    break;
 
+	  /*
+	     We have redirected the pc (ss->pc) and we continue. In other
+	     words, there is nothing left to emulate about this instruction.
+	   */
 	  continue;
 	}
 
@@ -2337,8 +2383,18 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	  /* Reset the search.  FIXME: Some barriers are only effective if used
 	     between the first and second loads...  */
 	  ss->conditional_tick = -1;
+
+
 	}
 
+      /*
+	 This resets whether or not we have seen
+	 1. first memory access
+	 2. second memory access
+	 3. attacker register value set
+	 4. an attacker-tainted register value used
+	 5. an attacker-tainted memory value used
+       */
       reset_probes ();
 
       /* Simulate the instruction.  */
@@ -2432,7 +2488,6 @@ x86_scan (bfd_byte * code, ulong size, ulong start, const char * filename, ulong
 
   num_found = 0;
 
-  einfo (VERBOSE2, "Running scan");
   run_scan (ss, start, end);
 
   if (num_found == 0)
@@ -2489,13 +2544,13 @@ x86_usage (void)
 
 struct callbacks target =
 {
-  EM_X86_64,
-  0,
-  "X86 Scanner",
-  x86_init,
-  NULL,		/* x86_finish */
-  x86_scan,
-  NULL,		/* x86_final_report */
-  x86_options,
-  x86_usage
+  EM_X86_64,     /* em_type */
+  0,             /* em_type2 */
+  "X86 Scanner", /* scanner_name */
+  x86_init,      /* init */
+  NULL,		 /* finish (x86_finish) */
+  x86_scan,      /* scanner */
+  NULL,		 /* final_report (x86_final_report) */
+  x86_options,   /* process_arg */
+  x86_usage      /* usage */
 };

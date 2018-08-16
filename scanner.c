@@ -34,7 +34,7 @@ struct archive_info
   ulong   next_arhdr_offset;      /* Offset of the next archive header.  */
   bool    is_thin_archive;        /* TRUE if this is a thin archive.  */
   bool    uses_64bit_indicies;    /* TRUE if the index table uses 64bit entries.  */
-  arhdr   arhdr;                  /* Current archive header.  */
+  struct ar_hdr   arhdr;                  /* Current archive header.  */
 };
 
 static ulong  archive_file_size;
@@ -560,7 +560,7 @@ get_data (void * var,
 
   if (var == NULL)
     {
-      mvar = xmalloc (amt + 1);
+      mvar = (void*)xmalloc (amt + 1);
       ((char *) mvar)[amt] = '\0';
     }
   else

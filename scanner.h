@@ -12,7 +12,12 @@
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   GNU General Public License for more details.  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+
+#define basename basename
+
 #include <assert.h>
 #include <errno.h>
 #include <stddef.h>
@@ -45,7 +50,7 @@
 typedef unsigned char  uchar;
 typedef unsigned int   uint;
 typedef unsigned long  ulong;
-typedef bfd_boolean    bool;
+//typedef bfd_boolean    bool;
 typedef struct ar_hdr  arhdr;
 
 /* An enum controlling the behaviour of the einfo function:  */
