@@ -1,0 +1,85 @@
+diff --git a/sim/aarch64/simulator.c b/sim/aarch64/simulator.c
+index 18f7944ce6..e39ac4304d 100644
+--- a/sim/aarch64/simulator.c
++++ b/sim/aarch64/simulator.c
+@@ -13996,6 +13996,10 @@ system_get (sim_cpu *cpu, unsigned op0, unsigned op1, unsigned crn,
+     /* TPIDR_EL0 - thread pointer id.  */
+     return aarch64_get_thread_id (cpu);
+ 
++  if (crn == 13 && op1 == 0 && crm == 0 && op2 == 4)
++    /* TPIDR_EL1 - thread pointer id.  */
++    return aarch64_get_thread_id (cpu);
++
+   if (op1 == 3 && crm == 4 && op2 == 0)
+     return aarch64_get_FPCR (cpu);
+ 
+@@ -14005,6 +14009,14 @@ system_get (sim_cpu *cpu, unsigned op0, unsigned op1, unsigned crn,
+   else if (op1 == 3 && crm == 2 && op2 == 0)
+     return aarch64_get_CPSR (cpu);
+ 
++  else if (op2 == 0 && crm == 1)
++    /* EL0 stack pointer.  */
++    return aarch64_get_reg_u64 (cpu, 31, SP_OK);
++
++  else if (op1 == 3 && op2 == 1 && crn == 4 && crm == 2)
++    /* DAIF bits in the pSTATE register.  */
++    return 0;
++
+   HALT_NYI;
+ }
+ 
+@@ -14026,9 +14038,9 @@ system_set (sim_cpu *cpu, unsigned op0, unsigned op1, unsigned crn,
+ }
+ 
+ static void
+-do_mrs (sim_cpu *cpu)
++do_MRS (sim_cpu *cpu)
+ {
+-  /* instr[31:20] = 1101 0101 0001 1
++  /* instr[31:20] = 1101 0101 0011
+      instr[19]    = op0
+      instr[18,16] = op1
+      instr[15,12] = CRn
+@@ -14042,6 +14054,8 @@ do_mrs (sim_cpu *cpu)
+   unsigned sys_op2 = INSTR (7, 5);
+   unsigned rt = INSTR (4, 0);
+ 
++  NYI_assert (31, 20, 0xD53);
++
+   TRACE_DECODE (cpu, "emulated at line %d", __LINE__);
+   aarch64_set_reg_u64 (cpu, rt, NO_SP,
+ 		       system_get (cpu, sys_op0, sys_op1, sys_crn, sys_crm, sys_op2));
+@@ -14075,9 +14089,9 @@ do_MSR_immediate (sim_cpu *cpu)
+   else if (op1 == 3)
+     {
+       if (op2 == 6)
+-	HALT_NYI; /* set DAIFset.  */
++	return; 	/* set DAIFset - FIXME: treat as a noop for now.  */
+       else if (op2 == 7)
+-	HALT_NYI; /* set DAIFclr.  */
++	return; 	/* set DAIFclr - FIXME: treat as a noop for now.  */
+       else
+ 	HALT_UNALLOC;
+     }
+@@ -14190,18 +14204,14 @@ dexSystem (sim_cpu *cpu)
+ 	}
+       }
+ 
+-    case 0x3B0:
+-    case 0x3B4:
+-    case 0x3BD:
+-      do_mrs (cpu);
+-      return;
+-
+     case 0x0B7:
+       do_SYS (cpu); /* DC is an alias of SYS.  */
+       return;
+ 
+     default:
+-      if (INSTR (21, 20) == 0x1)
++      if (INSTR (21, 20) == 0x3)
++	do_MRS (cpu);
++      else if (INSTR (21, 20) == 0x1)
+ 	do_MSR_reg (cpu);
+       else if (INSTR (21, 19) == 0 && INSTR (15, 12) == 0x4)
+ 	do_MSR_immediate (cpu);
