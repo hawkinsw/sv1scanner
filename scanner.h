@@ -42,6 +42,10 @@
 #include <elf/common.h>
 #include <elf/external.h>
 #include <elf/internal.h>
+#include <memory>
+#include <stack>
+
+#include "memory.hpp"
 
 #define streq(a,b)	  (strcmp ((a), (b)) == 0)
 #define strneq(a,b,n)	  (strncmp ((a), (b), (n)) == 0)
