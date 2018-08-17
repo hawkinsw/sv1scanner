@@ -14,10 +14,12 @@
 
 #include "scanner.h"
 
+using namespace std;
+
 extern "C" {
-int print_insn_i386 (bfd_vma, disassemble_info *);
-int print_insn_i386_intel (bfd_vma, disassemble_info *);
-int print_insn_i386_att (bfd_vma, disassemble_info *);
+	int print_insn_i386 (bfd_vma, disassemble_info *);
+	int print_insn_i386_intel (bfd_vma, disassemble_info *);
+	int print_insn_i386_att (bfd_vma, disassemble_info *);
 }
 
 /* Number of bytes on the stack.  */
@@ -44,6 +46,8 @@ int print_insn_i386_att (bfd_vma, disassemble_info *);
 #define FIRST_XMM_REGNO 24
 #define CC_REGNO        40
 
+stack<shared_ptr<MemorySpace>> memory_spaces;
+MemorySpace *current_memory_space;
 enum insn_class
 {
   ic_none = 0,
@@ -439,6 +443,8 @@ static ulong
 read_reg (scan_state * ss, int reg)
 {
   ulong val;
+  RegisterValue reg_val;
+  ValueContents_t rval = RegisterValue::DefaultRegisterValue();
 
   if (reg < 0 || reg > NUM_REGISTERS)
     {
@@ -447,7 +453,11 @@ read_reg (scan_state * ss, int reg)
     }
   
   val = ss->regs[reg];
-  
+ 
+  if (current_memory_space->GetRegisterValue(reg, reg_val)) 
+    {
+      rval = reg_val.GetValue();
+    }
   if (! suppress_checks)						
     {
       /* Record when a register containing an				
@@ -465,17 +475,22 @@ read_reg (scan_state * ss, int reg)
 	}
     }
 
+  assert(val == rval);
   return val;
 }
 
 static void
 write_reg (scan_state * ss, int reg, ulong val)
 {
+  RegisterValue reg_val;
+
   if (reg < 0 || reg > NUM_REGISTERS)
     {
       einfo (FAIL, "Bad Reg WRITE %d", reg);
       return;
     }
+
+  einfo(VERBOSE2, "Wrote 0x%llx into register %d", val, reg);
 
   if (! suppress_checks)						
     {									
@@ -506,6 +521,10 @@ write_reg (scan_state * ss, int reg, ulong val)
     }									
 
   ss->regs[reg] = val;
+
+  reg_val.SetLocation(reg);
+  reg_val.SetValue(val);
+  current_memory_space->SetRegisterValue(reg_val);
 }
 
 /* -------------------------------------------------------------------- */
@@ -546,7 +565,11 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
 {
   const char * orig_text = text;
   bool negated = FALSE;
+  int scale = 1;
   ulong addr_off = 0;
+  ulong base_register = -1;
+  ulong scale_register = -1;
+  ulong base_register_value = 0, scale_register_value = 1;
 
   arg->type = type_address;
   arg->value = RANDOM_MEM_VAL;
@@ -558,8 +581,10 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
       const char * p = strstr (text, "# &0x");
       if (p)
 	{
-	  p += 4;
+	  p += 3;
 	  addr_off = strtoul (p, NULL, 16);
+	  einfo(VERBOSE2, "Found disassembly generated absolute address: 0x%llx", addr_off);
+	  arg->value = addr_off;
 	  return TRUE;
 	}
     }
@@ -568,6 +593,7 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
     {
     case '*': /* absolute addressing ?  */
       arg->value = strtoul (text, NULL, 16);
+      einfo (VERBOSE2, "parse_mem_arg: Absolute addressing: 0x%llx",arg->value);
       return TRUE;
 
     case '-':
@@ -580,31 +606,39 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
       text++;
       /* Fall through.  */
     case '0':
+      /*
+	 addr_offset(base_register, scale_register, scale)
+       */
       if (*text != 'x')
 	{
 	  einfo (FAIL, "parse mem fail 2");
 	  return FALSE;
 	}
+      einfo (VERBOSE2, "parse_mem_arg: Address offset.");
       text++;
       addr_off = strtoul (text, (char **) (& text), 16);
       if (negated)
 	addr_off = - addr_off;
 
       if (*text != '(')
-	return TRUE;
+	{
+	  einfo (VERBOSE2, "parse_mem_arg: Address offset only.");
+	  arg->value = addr_off;
+	  return TRUE;
+	}
       /* Register +- offset addressing.  */
       text++;
       /* Fall through.  */
     case '(': /* Register relative addressing ?  */
       if (*text == '%')
 	{
+	  einfo (VERBOSE2, "parse_mem_arg: Register relative (base).");
 	  text++;
-	  arg->type = type_register_address;
-	  arg->value = parse_reg (ss, & text, lval);
+	  base_register = parse_reg (ss, & text, lval);
 	}
       if (*text == ',')
 	{
-	  int scale = 1;
+	  einfo (VERBOSE2,"parse_mem_arg: Register relative (scale register).");
 
 	  text++;
 	  if (*text != '%')
@@ -613,9 +647,10 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
 	      return FALSE;
 	    }
 	  text++;
-	  arg->value = parse_reg (ss, & text, lval);
+	  scale_register = parse_reg (ss, & text, lval);
 	  if (*text == ',')
 	    {
+	      einfo (VERBOSE2, "parse_mem_arg: Register relative (scale).");
 	      text++;
 	      scale = (  *text == '1' ? 1
 		       : *text == '2' ? 2
@@ -639,6 +674,19 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
       text++;
       if (end)
 	*end = text;
+      /*
+	 Now that we are here, we have an addr_off, base_register, 
+	 scale_register and a scale. Calculate the value!
+       */
+      if (base_register != -1)
+	base_register_value = read_reg (ss, base_register);
+      if (scale_register != -1)
+	scale_register_value = read_reg (ss, scale_register);
+
+      einfo(VERBOSE2, "base_register_value: 0x%llx", base_register_value);
+      einfo(VERBOSE2, "scale_register_value: 0x%llx", scale_register_value);
+
+      arg->value = addr_off + base_register_value + scale_register_value*scale;
       return TRUE;
 
     default:
@@ -695,11 +743,13 @@ parse_arg (scan_state * ss, const char * text, const char ** end, arg * arg, boo
 	  break;
 	}
 
+      einfo(VERBOSE2, "parse_arg: Reading register.");
       arg->type = type_register;
       arg->value = parse_reg (ss, & text, lval);
       break;
 
     case '$': /* Constant.  */
+      einfo(VERBOSE2, "parse_arg: Reading constant.");
       arg->type = type_constant;
       arg->value = strtoul (text, NULL, 0);
       break;
@@ -708,11 +758,12 @@ parse_arg (scan_state * ss, const char * text, const char ** end, arg * arg, boo
     case '-':
     case '0': /* Register offset addressing ?  */
     case '(': /* Register relative addressing ? */
-      einfo(VERBOSE2, "Doing some type of memory reading for parse_arg.");
+      einfo(VERBOSE2, "parse_arg: Reading memory.");
       ret = parse_mem_arg (ss, text - 1, & text, arg, lval);
       break;
 
     case '&': /* Absolute address.  */
+      einfo(VERBOSE2, "parse_arg: Reading absolutely address.");
       arg->type = type_address;
       arg->value = strtoul (text, NULL, 0);
       break;
@@ -764,6 +815,7 @@ x86_read_mem (bfd_vma addr, bfd_byte * buffer, unsigned len, struct disassemble_
 static ulong
 read_mem (scan_state * ss, ulong addr)
 {
+  MemoryValue mv(addr);
   ulong * paddr = (ulong *) addr;
 
   if (! suppress_checks)
@@ -792,6 +844,7 @@ read_mem (scan_state * ss, ulong addr)
   
   if (paddr >= emul_info.stack && paddr < emul_info.stack + STACK_SIZE)
     {
+      einfo(VERBOSE2, "reading from the stack.");
       return * paddr;
     }
 
@@ -799,11 +852,21 @@ read_mem (scan_state * ss, ulong addr)
     {
       ulong val;
 
+      einfo(VERBOSE2, "reading from program memory.");
+
       x86_read_mem (addr, (bfd_byte *) & val, sizeof (val), & info);
       return val;
     }
 
-  return RANDOM_MEM_VAL;
+  einfo(VERBOSE2, "Reading from somewhere else (heap?) in memory: %llx.", addr);
+
+  if (current_memory_space->GetMemoryValue(addr, mv))
+    {
+      einfo(VERBOSE2, "GetMemoryValue(): Found existing value in memory.");
+      return mv.GetValue();
+    }
+  einfo(VERBOSE2, "Returning the initializer.");
+  return current_memory_space->GetInitializer();
 }
 
 static void
@@ -931,6 +994,10 @@ add_move (scan_state * ss, arg * input, arg * output)
 static bool
 handle_mov (scan_state * ss, insn_info * info, const char * args)
 {
+  /*
+     Source is in arg1;
+     Destination is in arg2;
+   */
   if (   ! parse_arg (ss, args, & args, & arg1, FALSE)
       || ! parse_arg (ss, args, NULL,   & arg2, TRUE))
     return handler_error (ss, "Failed to parse arg of move type insn");
@@ -942,12 +1009,15 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
     case sc_mov_zext:
     case sc_mov_sext:
     case sc_mov_mov:
-      if (arg2.type == type_register || arg2.type == type_register_address)
+      /*
+	 mov from something to a register.
+       */
+      if (arg2.type == type_register)
 	{
 	  switch (arg1.type)
 	    {
 	    case type_register:
-	    case type_register_address:
+//	    case type_register_address:
 	      SET_REG_FROM_ARG (ss, arg2, GET_REG_FROM_ARG (ss, arg1));
 	      break;
 	    case type_address:
@@ -960,9 +1030,12 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	      return handler_error (ss, "unhandled MOV");
 	    }
 	}
-      else
+      /*
+	 mov from something to an address.
+       */
+      else if (arg2.type == type_address)
 	{
-	  einfo(VERBOSE2, "Not handling move to non-register relative memory.");
+	  einfo(VERBOSE2, "TODO: Moving something to a memory address.");
 	}
       break;
 
@@ -2342,6 +2415,9 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	    {
 	      scan_state * new_state;
 
+	      memory_spaces.push(make_shared<MemorySpace>(*current_memory_space));
+	      current_memory_space = memory_spaces.top().get();
+
 	      einfo (VERBOSE2, "assume branch from %lx to %lx", this_pc, next);
 	      new_state = clone_state (ss, next);
 	      if (new_state == NULL)
@@ -2353,6 +2429,9 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	      einfo (VERBOSE2, "restoring state to cond branch at %lx", this_pc);
 	      release_state (new_state);
 	      restore_stack (ss);
+
+	      memory_spaces.pop();
+	      current_memory_space = memory_spaces.top().get();
 	    }
 	  else if (next == -1UL)
 	    einfo (VERBOSE2, "assume branch not taken");
@@ -2462,6 +2541,9 @@ bool
 x86_scan (bfd_byte * code, ulong size, ulong start, const char * filename, ulong entry)
 {
   ulong end = start + size;
+
+  memory_spaces.push(make_shared<MemorySpace>(2));
+  current_memory_space = memory_spaces.top().get();
 
   /* If the user did not give us a start address then default to the beginning of the binary.  */
   if (start_address == 0 && start_address < start)
