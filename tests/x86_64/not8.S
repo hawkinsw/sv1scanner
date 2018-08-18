@@ -1,0 +1,55 @@
+	
+	.global fail_tests
+fail_tests:
+
+	je     1f
+	movl   $0x0,0x1060(%rdi)
+	movl   $0x0,0x1064(%rdi)
+	lea    0x107c(%rdi),%rdi
+	movl   $0x0,-0x14(%rdi)
+	mov    -0x8(%rsi),%rdx
+	xor    %eax,%eax
+	mov    $0xffffffff81aa2bca,%rsi
+	callq  1f
+	push   %rbp
+	mov    %rsp,%rbp
+	push   %r13
+	push   %r12
+	push   %rbx
+	mov    %rdi,%rbx
+	sub    $0x50,%rsp
+	mov    %rdx,0x30(%rsp)
+	mov    %rcx,0x38(%rsp)
+	mov    %r8,0x40(%rsp)
+	mov    %r9,0x48(%rsp)
+	mov    0x1008(%rdi),%r12d
+	mov    %gs:0x28,%rax
+	mov    %rax,0x18(%rsp)
+	xor    %eax,%eax
+	mov    0x1000(%rdi),%eax
+	test   %r12d,%r12d
+	jne    1f
+	mov    $0xfff,%ecx
+	sub    %eax,%ecx
+	mov    %ecx,%r13d
+	jne    1f
+	lea    0x10(%rbp),%rax
+	mov    0x1000(%rdi),%edi
+	mov    %rsi,%rdx
+	movl   $0x10,(%rsp)
+	mov    %rax,0x8(%rsp)
+	lea    0x20(%rsp),%rax
+	mov    %rax,0x10(%rsp)
+	movslq %ecx,%rax
+	add    %rbx,%rdi
+	mov    %rsp,%rcx
+	mov    %rax,%rsi
+	callq  1f
+	push   %rbp
+	mov    %rsp,%rbp
+	push   %r15
+	push   %r14
+	push   %r13
+	push   %r12
+
+1:	hlt
