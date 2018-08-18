@@ -127,6 +127,8 @@ typedef struct reg_move
   int    dest;
 } reg_move;
 
+#define MAX_MEM 1024
+
 typedef struct scan_state
 {
   ulong       pc;		// The address of the insn being simulated.
@@ -139,6 +141,9 @@ typedef struct scan_state
   reg_move *  moves;
   uint        n_moves;
   int         next_move;
+  ulong       memory[MAX_MEM];
+  int         next_memory_slot;
+  int         v7_cmp_tick;
 } scan_state;
 
 typedef struct insn_info
@@ -214,14 +219,14 @@ static int              syntax = 0;
 static ulong            num_found = 0;
 static uint             max_num_branches = 32;
 static ulong            start_address = 0;
-static int              first_memory_access = -1;
+static bool             first_memory_access = FALSE;
 static int              second_memory_access = -1;
 static int              attacker_reg_val_set = -1;
 static int              attacker_reg_val_used = -1;
 static int              attacker_mem_val_used = -1;
 static bool             suppress_checks = FALSE;
 static uint             max_num_ticks = 1 << 12;
-static ulong            first_conditional_seen = 0;
+static bool             variant_4_store_detected = TRUE; /* FIXME! */
 
 static reg_name reg_names[] =
 {
@@ -357,6 +362,31 @@ char_to_index (int c)
   return 0;
 }
 
+static int
+reg_name_compar (const void * a, const void * b)
+{
+  return ((reg_name *) a)->value - ((reg_name *) b)->value;
+}
+
+/* Given a register number, return its name.
+   FIXME: Width not currently taken into account.  */
+
+static const char *
+get_reg_name (int num)
+{
+  void *    name;
+  reg_name  sought;
+
+  sought.value = num;
+  name = bsearch (& sought, reg_names, ARRAY_SIZE (reg_names), sizeof sought, reg_name_compar);
+  if (name != NULL)
+    return ((reg_name *) name)->name;
+
+  static char buf[128];
+  sprintf (buf, "<unknown reg number %d>", num);
+  return buf;
+}
+
 /* Convert the reg_names table into a tree structure that can be used to lex register names quickly.  */
 
 static void
@@ -465,13 +495,15 @@ read_reg (scan_state * ss, int reg)
       if (val == ATTACKER_MEM_VAL)					
 	{								
 	  attacker_mem_val_used = reg;					
-	  einfo (VERBOSE2, "attacker memory value loaded into reg %d has been used", reg); 
+	  einfo (VERBOSE2, "attacker memory value loaded into reg %%%s has been read",
+		 get_reg_name (reg)); 
 	}								
       else if (val == ATTACKER_REG_VAL)					
 	{
 	  if (attacker_reg_val_used == -1)
 	    attacker_reg_val_used = reg;
-	  einfo (VERBOSE2, "attacker controlled value in reg %d used", reg); 
+	  einfo (VERBOSE2, "attacker controlled value in reg %%%s read",
+		 get_reg_name (reg)); 
 	}
     }
 
@@ -486,37 +518,33 @@ write_reg (scan_state * ss, int reg, ulong val)
 
   if (reg < 0 || reg > NUM_REGISTERS)
     {
-      einfo (FAIL, "Bad Reg WRITE %d", reg);
+      einfo (FAIL, "Write to unknown register number: %d", reg);
       return;
     }
 
-  einfo(VERBOSE2, "Wrote 0x%llx into register %d", val, reg);
-
   if (! suppress_checks)						
     {									
+      if (reg == SP_REGNO)
+	/* SPECTRE attacks do not corrupt the stack.  */
+	;
       /* If the attacker value was read during this instruction, then	
 	 always set the destination value to ATTACKER, no matter how	
-	 it might have been transformed, so that we can track it.  */	
-      if (attacker_reg_val_used != -1)					
+	 it might have been transformed, so that we can track it.  */
+      else if (attacker_reg_val_used != -1)					
 	{								
-	  if (first_memory_access && first_conditional_seen)
+	  if (first_memory_access && ss->conditional_tick != -1)
 	    {								
-	      einfo (VERBOSE2, "register %d set based on a value retrieved from an attacker controlled memory address", reg); 
+	      einfo (VERBOSE2, "register %%%s set based on a value retrieved from an attacker controlled memory address",
+		     get_reg_name (reg)); 
 	      attacker_reg_val_set = reg;				
 	      val = ATTACKER_MEM_VAL;					
 	    }								
 	  else
 	    {
-	      einfo (VERBOSE2, "register %d updated after read from poisoned register", reg);
+	      einfo (VERBOSE2, "register %%%s updated after read from poisoned register",
+		     get_reg_name (reg));
 	      val = ATTACKER_REG_VAL;
 	    }
-	}
-      else if (val != ATTACKER_REG_VAL && val != ATTACKER_MEM_VAL)
-	{
-	  if (ss->regs[reg] == ATTACKER_REG_VAL)
-	    val = ATTACKER_REG_VAL;
-	  else if (ss->regs[reg] == ATTACKER_MEM_VAL)
-	    val = ATTACKER_MEM_VAL;
 	}
     }									
 
@@ -550,10 +578,9 @@ parse_reg (scan_state * ss, const char ** ptext, bool lval)
 
       *ptext = text;
 
-      if (! lval)
-	/* Read the register so that its access will be noted.  */
-	(void) read_reg (ss, r->value);
-	
+      /* Read the register so that its access will be noted.  */
+      (void) read_reg (ss, r->value);
+      
       return r->value;
     }
 
@@ -636,10 +663,13 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
 	  text++;
 	  base_register = parse_reg (ss, & text, lval);
 	}
+      else
+	arg->value = 0;
+
+      arg->value += addr_off;
+
       if (*text == ',')
 	{
-	  einfo (VERBOSE2,"parse_mem_arg: Register relative (scale register).");
-
 	  text++;
 	  if (*text != '%')
 	    {
@@ -664,6 +694,7 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
 		  scale = 1;
 		}
 	    }
+	  arg->value *= scale;
 	}
 
       if (*text != ')')
@@ -702,8 +733,7 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
 }
 
 /* Parse an argument at TEXT, updating END to point past the comma
-   following it, and store data in ARG.  IS_LEA is true if this is
-   for the first operand of a lea instruction;  */
+   following it, and store data in ARG.  */
 
 static bool
 parse_arg (scan_state * ss, const char * text, const char ** end, arg * arg, bool lval)
@@ -791,7 +821,7 @@ x86_emul_fetch_byte (ulong addr)
       if (offset != RANDOM_MEM_VAL)
 	{
 	  /* FIXME: We should load kernel data sections as well...  */
-	  einfo (WARN, "Attempt to read from unmapped memory address: %lx", addr);
+	  einfo (VERBOSE, "Attempt to read from unmapped memory address: %lx", addr);
 	  emul_info.status = FALSE;
 	}
       return 0;
@@ -812,25 +842,61 @@ x86_read_mem (bfd_vma addr, bfd_byte * buffer, unsigned len, struct disassemble_
 #define GET_REG_FROM_ARG(SS,ARG)       read_reg ((SS), (ARG).value)
 #define SET_REG_FROM_ARG(SS,ARG,VAL)  write_reg ((SS), (ARG).value, (VAL))
 
+static bool
+address_previously_stored (scan_state * ss, ulong addr)
+{
+  int i;
+
+  for (i = 0; i < ss->next_memory_slot; i++)
+    if (ss->memory[i] == addr)
+      return TRUE;
+
+  return FALSE;
+}
+
 static ulong
 read_mem (scan_state * ss, ulong addr)
 {
-  MemoryValue mv(addr);
+  MemoryValue mv;
   ulong * paddr = (ulong *) addr;
+
+  if (paddr >= emul_info.stack && paddr < emul_info.stack + STACK_SIZE)
+    return * paddr;
 
   if (! suppress_checks)
     {
+      if (variant & VARIANT_7
+	  && ss->v7_cmp_tick
+	  && ss->conditional_tick > 0
+	  && address_previously_stored (ss, addr))
+	{
+	  einfo (VERBOSE2, "load from address (%#lx) previously stored", addr);
+	  second_memory_access = -2;
+	}
+      
       if (attacker_mem_val_used != -1)
 	{
 	  /* If memory is being accessed after an attacker controlled value
 	     was read from a register, then we presume that the attacker
 	     is forcing a specific line to loaded into the data cache.  */
-	  second_memory_access = attacker_mem_val_used;
-	  einfo (VERBOSE2, "second memory access detected (read)");
+	  if (variant & VARIANT_1)
+	    {
+	      second_memory_access = attacker_mem_val_used;
+	      einfo (VERBOSE2, "second memory access detected (read using value in register %d)", attacker_mem_val_used);
+	    }
+	  else if ((variant & VARIANT_4) && variant_4_store_detected)
+	    {
+	      second_memory_access = attacker_mem_val_used;
+	      einfo (VERBOSE2, "second memory access detected (read using value in register %d)", attacker_mem_val_used);
+	    }
+	  else
+	    {
+	      einfo (VERBOSE2, "second memory access detected (read) - ignored");
+	    }
 	}
       else if (attacker_reg_val_used != -1)
 	{
-	  if (first_conditional_seen)
+	  if (ss->conditional_tick != -1)
 	    {
 	      /* If memory is being accessed after an attacker provided value
 		 was read from a register, then we presume that the attacker is
@@ -842,12 +908,6 @@ read_mem (scan_state * ss, ulong addr)
 	}								
     }
   
-  if (paddr >= emul_info.stack && paddr < emul_info.stack + STACK_SIZE)
-    {
-      einfo(VERBOSE2, "reading from the stack.");
-      return * paddr;
-    }
-
   if (addr >= emul_info.code_base && addr <= emul_info.code_base + emul_info.size)
     {
       ulong val;
@@ -875,24 +935,53 @@ write_mem (scan_state * ss, ulong addr, ulong value)
   ulong * paddr = (ulong *) addr;
 
   if (paddr >= emul_info.stack && paddr <= emul_info.stack + STACK_SIZE)
-    * paddr = value;
-  else
     {
       if (! suppress_checks)
-	{
-	  if (attacker_mem_val_used != -1
-	      || addr == ATTACKER_MEM_VAL)
-	    {
-	      /* If memory is being written to an attacker controlled value
-		 was read from a register, then we presume that the attacker
-		 is forcing a specific line to loaded into the data cache.  */
-	      second_memory_access = attacker_mem_val_used;
-	      einfo (VERBOSE2, "second memory access detected (write)");
-	    }
-	  else if (addr != RANDOM_MEM_VAL)
-	    einfo (WARN, "BAD write to %lx ?", addr);
-	}	
+	einfo (VERBOSE2, "Value stored on stack at address %#lx", addr);
+      * paddr = value;
+      return;
     }
+
+  if (! suppress_checks)
+    {
+      if (variant & VARIANT_7
+	  && ss->v7_cmp_tick
+	  && ss->conditional_tick > 0)
+	{
+	  /* Record this access for variant 7 checking.  */
+	  if (ss->next_memory_slot >= MAX_MEM)
+	    einfo (VERBOSE, "Memory recording exhausted");
+	  else
+	    ss->memory [ss->next_memory_slot ++] = addr;
+	}
+
+      if (attacker_mem_val_used != -1
+	  || addr == ATTACKER_MEM_VAL)
+	{
+	  /* If memory is being written to an address that might have been
+	     computed using a value that was read from a (different) attacker
+	     controlled address, then we presume that the attacker is forcing
+	     a specific line to be loaded into the data cache.  */
+	  if (variant & VARIANT_1)
+	    {
+	      second_memory_access = attacker_mem_val_used;
+	      einfo (VERBOSE2, "second memory access detected (write using value in register %d)",
+		     attacker_mem_val_used);
+	    }
+	  else if ((variant & VARIANT_4) && variant_4_store_detected)
+	    {
+	      second_memory_access = attacker_mem_val_used;
+	      einfo (VERBOSE2, "second memory access detected (write using value in register %d)",
+		     attacker_mem_val_used);
+	    }
+	  else
+	    {
+	      einfo (VERBOSE2, "second memory access detected (write) - ignored");
+	    }
+	}
+    }	
+
+  /* Note - we are not currently recording the actual values stored.  */
 }
 
 static bool
@@ -966,7 +1055,7 @@ reg_from_arg (arg * regarg)
 static void
 add_reg_move (scan_state * ss, int in_reg, int out_reg)
 {
-  if (in_reg == -1 || out_reg == -1)
+  if (in_reg == -1 || out_reg == -1 || in_reg == out_reg)
     return;
      
   if (ss->n_moves == ss->next_move)
@@ -994,56 +1083,111 @@ add_move (scan_state * ss, arg * input, arg * output)
 static bool
 handle_mov (scan_state * ss, insn_info * info, const char * args)
 {
-  /*
-     Source is in arg1;
-     Destination is in arg2;
-   */
-  if (   ! parse_arg (ss, args, & args, & arg1, FALSE)
-      || ! parse_arg (ss, args, NULL,   & arg2, TRUE))
+  ulong val;
+  int amvu_arg1, amvu_arg2;
+  int arvu_arg1, arvu_arg2;
+
+  attacker_mem_val_used = -1;
+  if (! parse_arg (ss, args, & args, & arg1, FALSE))
+    return handler_error (ss, "Failed to parse arg1 of move type insn");
+  amvu_arg1 = attacker_mem_val_used;
+  arvu_arg1 = attacker_reg_val_used;
+
+  attacker_mem_val_used = -1;
+
+  if (! parse_arg (ss, args, NULL,   & arg2, TRUE))
     return handler_error (ss, "Failed to parse arg of move type insn");
+
+  amvu_arg2 = attacker_mem_val_used;
+  arvu_arg2 = attacker_reg_val_used;
+
+  attacker_mem_val_used = -1;
 
   add_move (ss, & arg1, & arg2);
 
   switch (info->type)
     {
+    default:
+      return handler_error (ss, "unknown MOV type");
+
     case sc_mov_zext:
     case sc_mov_sext:
     case sc_mov_mov:
-      /*
-	 mov from something to a register.
-       */
-      if (arg2.type == type_register)
+      break;
+    }
+
+  switch (arg2.type)
+    {
+    case type_register:
+      switch (arg1.type)
 	{
-	  switch (arg1.type)
-	    {
-	    case type_register:
-//	    case type_register_address:
-	      SET_REG_FROM_ARG (ss, arg2, GET_REG_FROM_ARG (ss, arg1));
-	      break;
-	    case type_address:
-	      SET_REG_FROM_ARG (ss, arg2, read_mem (ss, arg1.value));
-	      break;
-	    case type_constant:
-	      SET_REG_FROM_ARG (ss, arg2, arg1.value);
-	      break;
-	    default:
-	      return handler_error (ss, "unhandled MOV");
-	    }
-	}
-      /*
-	 mov from something to an address.
-       */
-      else if (arg2.type == type_address)
-	{
-	  einfo(VERBOSE2, "TODO: Moving something to a memory address.");
+	case type_register:
+	  /* Register to register move.  */
+	  val = GET_REG_FROM_ARG (ss, arg1);
+	  SET_REG_FROM_ARG (ss, arg2, val);
+	  return TRUE;
+
+	case type_address:
+	  /* Load from memory.  */
+	  attacker_mem_val_used = amvu_arg1;
+	  attacker_reg_val_used = arvu_arg1;
+	  val = read_mem (ss, arg1.value);
+	  SET_REG_FROM_ARG (ss, arg2, val);
+	  return TRUE;
+
+	case type_constant:
+	  /* Store a constant into a register.  */
+	  SET_REG_FROM_ARG (ss, arg2, arg1.value);
+	  return TRUE;
+
+	default:
+	  break;
 	}
       break;
 
+    case type_address:
+      switch (arg1.type)
+	{
+	case type_register:
+	  /* Store into memory.  */
+	  val = GET_REG_FROM_ARG (ss, arg1);
+	  /* Do not let the value read out of the register that is going
+	     to be written into memory, trigger a SPECTRE detection.
+	     See test x86_64/not5.S for an example.  */
+	  attacker_mem_val_used = amvu_arg2;
+	  attacker_reg_val_used = arvu_arg2;
+	  write_mem (ss, arg2.value, val);
+	  return TRUE;
+
+	case type_address:
+	  /* Memory to memory copy.  */
+	  attacker_mem_val_used = amvu_arg1;
+	  attacker_reg_val_used = arvu_arg1;
+	  val = read_mem (ss, arg1.value);
+
+	  attacker_mem_val_used = amvu_arg2;
+	  attacker_reg_val_used = arvu_arg2;
+	  write_mem (ss, arg2.value, val);
+	  return TRUE;
+
+	case type_constant:
+	  /* Store a constant into memory.  */
+	  write_mem (ss, arg2.value, arg1.value);
+	  return TRUE;
+
+	default:
+	  break;
+	}
+      break;
+
+    case type_constant:
+      return handler_error (ss, "MOV into a constant ?");
+
     default:
-      return handler_error (ss, "unknown MOV type");
+      break;
     }
 
-  return TRUE;
+  return handler_error (ss, "unexpected MOV type");
 }
 
 static bool
@@ -1169,24 +1313,30 @@ handle_cmpxchg (scan_state * ss, insn_info * info, const char * args)
   return TRUE;
 }
 
-#define DO_BINOP(SS,NAME,OP)					\
+#define DO_BINOP(SS,NAME,OP,AMVU_ARG1, ARVU_ARG1)		\
   do								\
     {								\
       if (arg2.type == type_register)				\
 	{							\
+	  ulong val;						\
+	  int reg = GET_REG_FROM_ARG (SS, arg2);		\
+								\
 	  switch (arg1.type)					\
 	    {							\
 	    case type_unknown:					\
 	      einfo (VERBOSE2, "uknown " #NAME " operation");	\
 	      break;						\
 	    case type_register:					\
-	      SET_REG_FROM_ARG (SS, arg2, GET_REG_FROM_ARG (SS, arg2) OP GET_REG_FROM_ARG (SS, arg1)); \
+	      SET_REG_FROM_ARG (SS, arg2, reg OP GET_REG_FROM_ARG (SS, arg1)); \
 	      break;						\
 	    case type_address:					\
-	      SET_REG_FROM_ARG (SS, arg2, GET_REG_FROM_ARG (SS, arg2) OP read_mem (SS, arg1.value)); \
+	      attacker_mem_val_used = AMVU_ARG1;		\
+	      attacker_reg_val_used = ARVU_ARG1;		\
+	      val = read_mem (SS, arg1.value);			\
+	      SET_REG_FROM_ARG (SS, arg2, reg OP val);		\
 	      break;						\
 	    case type_constant:					\
-	      SET_REG_FROM_ARG (SS, arg2, GET_REG_FROM_ARG (SS, arg2) OP arg1.value); \
+	      SET_REG_FROM_ARG (SS, arg2, reg OP arg1.value);	\
 	      break;						\
 	    default:						\
 	      /* FIXME */					\
@@ -1199,24 +1349,40 @@ handle_cmpxchg (scan_state * ss, insn_info * info, const char * args)
 static bool
 handle_two_op (scan_state * ss, insn_info * info, const char * args)
 {
-  if (   ! parse_arg (ss, args, & args, & arg1, FALSE)
-      || ! parse_arg (ss, args, NULL,   & arg2, TRUE))
-    return handler_error (ss, "Failed to parse arg of binary type insn");
+  int amvu_arg1;
+  int arvu_arg1;
+
+  attacker_mem_val_used = -1;
+  if (! parse_arg (ss, args, & args, & arg1, FALSE))
+    return handler_error (ss, "Failed to parse arg1 of two-op type insn");
+  amvu_arg1 = attacker_mem_val_used;
+  arvu_arg1 = attacker_reg_val_used;
+
+  if (! parse_arg (ss, args, NULL,   & arg2, TRUE))
+    return handler_error (ss, "Failed to parse arg2 of two-op type insn");
 
   switch (info->type)
     {
     case sc_bin_add: /* Addition - we ignore the carry flag...  */
       add_move (ss, & arg1, & arg2);
-      DO_BINOP (ss, PLUS, +);
+      DO_BINOP (ss, PLUS, +, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_and:
       add_move (ss, & arg1, & arg2);
-      DO_BINOP (ss, AND, &);
+      DO_BINOP (ss, AND, &, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_cmp:
       /* We don't model effects on condition codes just yet.  */
+
+      if (variant & VARIANT_7
+	  && attacker_reg_val_used != -1
+	  && ss->v7_cmp_tick == 0)
+	{
+	  einfo (VERBOSE2, "poisoned comparison operation");
+	  ss->v7_cmp_tick = ss->tick;
+	}
       break;
 
     case sc_bin_test:
@@ -1225,17 +1391,17 @@ handle_two_op (scan_state * ss, insn_info * info, const char * args)
 
     case sc_bin_or:
       add_move (ss, & arg1, & arg2);
-      DO_BINOP (ss, IOR, |);
+      DO_BINOP (ss, IOR, |, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_xor:
       add_move (ss, & arg1, & arg2);
-      DO_BINOP (ss, XOR, ^);
+      DO_BINOP (ss, XOR, ^, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_sub:  /* We ignore the carry flag...  */
       add_move (ss, & arg1, & arg2);
-      DO_BINOP (ss, MINUS, -);
+      DO_BINOP (ss, MINUS, -, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_lea:
@@ -1262,8 +1428,14 @@ handle_two_op (scan_state * ss, insn_info * info, const char * args)
 static bool
 handle_shift (scan_state * ss, insn_info * info, const char * args)
 {
+  int amvu_arg1;
+  int arvu_arg1;
+
+  attacker_mem_val_used = -1;
   if (! parse_arg (ss, args, & args, & arg1, FALSE))
-    return handler_error (ss, "Failed to parse first arg of binary type insn");
+    return handler_error (ss, "Failed to parse arg1 of move type insn");
+  amvu_arg1 = attacker_mem_val_used;
+  arvu_arg1 = attacker_reg_val_used;
 
   if (! parse_arg (ss, args, NULL, & arg2, TRUE))
     {
@@ -1278,23 +1450,23 @@ handle_shift (scan_state * ss, insn_info * info, const char * args)
   switch (info->type)
     {
     case sc_bin_rol:
-      DO_BINOP (ss, ROTATE, <<);
+      DO_BINOP (ss, ROTATE, <<, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_ror:
-      DO_BINOP (ss, ROTATERT, >>);
+      DO_BINOP (ss, ROTATERT, >>, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_sar:
-      DO_BINOP (ss, ASHIFTRT, >>);
+      DO_BINOP (ss, ASHIFTRT, >>, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_shr:
-      DO_BINOP (ss, LSHIFTRT, >>);
+      DO_BINOP (ss, LSHIFTRT, >>, amvu_arg1, arvu_arg1);
       break;
 
     case sc_bin_shl:
-      DO_BINOP (ss, LSHIFT, >>);
+      DO_BINOP (ss, LSHIFT, >>, amvu_arg1, arvu_arg1);
       break;
 
     default:
@@ -1345,13 +1517,16 @@ handle_flow (scan_state * ss, insn_info * info, const char * args)
 static bool
 handle_stack (scan_state * ss, insn_info * info, const char * args)
 {
+  ulong saved_pc;
+
   switch (info->type)
     {
     case sc_stack_ret:
+      saved_pc = ss->pc;
       ss->pc = read_mem (ss, read_reg (ss, SP_REGNO));
       if (ss->pc < emul_info.code_base || ss->pc >= (emul_info.code_base + emul_info.size))
 	{
-	  einfo (FAIL, "POP BAD PC %#lx", ss->pc);
+	  einfo (VERBOSE, "POP without a PUSH ? at %#lx", saved_pc);
 	  emul_info.status = FALSE;
 	}
       write_reg (ss, SP_REGNO, read_reg (ss, SP_REGNO) + sizeof (emul_info.stack[0]));
@@ -1398,14 +1573,19 @@ handle_pop (scan_state * ss, insn_info * info, const char * args)
 
       if (arg1.type == type_register)
 	{
+	  /* Reading off the stack does not involve a real register read.  */
+	  suppress_checks = TRUE;
 	  SET_REG_FROM_ARG (ss, arg1, read_mem (ss, read_reg (ss, SP_REGNO)));
 	  add_move (ss, NULL, & arg1);
+	  suppress_checks = FALSE;
 	}
 
       /* Fall through.  */
     case sc_stack_pop1:
       /* FIXME: Model size of stack operations.  */
+      suppress_checks = TRUE;
       write_reg (ss, SP_REGNO, read_reg (ss, SP_REGNO) + sizeof (emul_info.stack[0]));
+      suppress_checks = FALSE;
       break;
 
     default:
@@ -1841,7 +2021,7 @@ x86_classify_insn (ulong pc, addr_info * info)
       unsigned len = pref->len;
 
       if (pref->size_suffix)
-	einfo (FAIL, "unexpecetd insn suffix");
+	einfo (FAIL, "unexpected insn suffix");
       if (strneq (t, pref->name, len))
 	{
 	  t += len;
@@ -1964,7 +2144,7 @@ scan_init (scan_state * ss, bfd_byte *code, ulong size, ulong start, ulong pc)
 
   suppress_checks = TRUE;
   for (reg = 0; reg <= NUM_REGISTERS; reg++)
-    write_reg (ss, reg, UNKNOWN_REG_VAL);
+    write_reg (ss, reg, UNKNOWN_REG_VAL + reg);
 
   /* Poison the parameter passing registers.  */
   static int param_regs [6] = { 7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 1 /* rcx */, 8 /* r8 */, 9 /* r9 */ };
@@ -1976,6 +2156,7 @@ scan_init (scan_state * ss, bfd_byte *code, ulong size, ulong start, ulong pc)
   ss->pc = pc;
   write_reg (ss, SP_REGNO, (ulong)(emul_info.stack + (STACK_SIZE - 1)));
 
+  ss->next_memory_slot = 0;
   suppress_checks = FALSE;
   return TRUE;
 }
@@ -2041,17 +2222,23 @@ display_insn (enum einfo_type type, ulong addr, const char * prefix)
 static void
 dump_tick (scan_state * ss, uint tick, uint move, int reg)
 {
+  bool stop = FALSE;
   const char * prefix = "        ";
 
-  if (tick == ss->conditional_tick)
+  if (variant & VARIANT_7
+      && tick == ss->v7_cmp_tick)
     {
-      display_insn (INFO, ss->insns[tick], " COND:  ");
-      return;
+      prefix = " CMP:   ";
+      stop = TRUE;
     }
-    
-  assert (tick > ss->conditional_tick);
 
-  if (move != -1 && ss->moves[move].tick == tick)
+  else if (tick == ss->conditional_tick)
+    {
+      prefix = " COND:  ";
+      stop = (variant & VARIANT_7) == 0 || ss->v7_cmp_tick == 0;
+    }
+  
+  else if (move != -1 && ss->moves[move].tick == tick)
     {
       if (reg == ss->moves[move].dest)
 	{
@@ -2062,20 +2249,26 @@ dump_tick (scan_state * ss, uint tick, uint move, int reg)
       move --;
     }
 
-  dump_tick (ss, tick - 1, move, reg);
+  if (! stop)
+    dump_tick (ss, tick - 1, move, reg);
+
   display_insn (INFO, ss->insns[tick], prefix);
 }
 
 static void
-dump_sequence (scan_state * ss, ulong second_load)
+dump_sequence (scan_state * ss, ulong second_load, const char * filename)
 {
   int tick;
 
-  einfo (INFO, "Possible sequence found, based on a starting address of %#lx:", start_address);
+  einfo (INFO, "%s: Possible sequence found, based on a starting address of %#lx:",
+	 filename, start_address);
 
   if (BE_VERBOSE)
-    for (tick = 0; tick < ss->conditional_tick; tick ++)
-      display_insn (INFO, ss->insns[tick], "        ");
+    {
+      int start = (variant & VARIANT_7) ? ss->v7_cmp_tick : ss->conditional_tick;
+      for (tick = 0; tick < start; tick ++)
+	display_insn (INFO, ss->insns[tick], "        ");
+    }
 
   dump_tick (ss, second_load, ss->next_move - 1, ss->moves[ss->next_move - 1].dest);
 }
@@ -2255,7 +2448,7 @@ is_undefined (insn_info * info)
 static void
 reset_probes (void)
 {
-  first_memory_access = -1;
+  first_memory_access = FALSE;
   second_memory_access = -1;
   attacker_reg_val_set = -1;
   attacker_reg_val_used = -1;
@@ -2338,7 +2531,7 @@ restore_stack (scan_state * ss)
 }
 
 static void
-run_scan (scan_state * ss, ulong start, ulong end)
+run_scan (scan_state * ss, ulong start, ulong end, const char * filename)
 {
   ulong start_pc = ss->pc;
 
@@ -2387,12 +2580,6 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	 what speculation does.  */
       if (is_conditional_branch (this_addr->insn))
 	{
-	  if (first_conditional_seen == 0)
-	    {
-	      einfo (VERBOSE2, "First conditional instruction seen at %#lx", this_pc);
-	      first_conditional_seen = ss->tick;
-	    }
-
 	  if (ss->num_branches ++ >= max_num_branches)
 	    {
 	      einfo (VERBOSE2, "RESET: maximum number of branches reached");
@@ -2402,6 +2589,12 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	  if (ss->conditional_tick == -1)
 	    {
 	      display_insn (VERBOSE2, this_pc, "START: conditional branch");
+
+	      ss->conditional_tick = ss->tick;
+	    }
+	  else if (ss->v7_cmp_tick)
+	    {
+	      display_insn (VERBOSE2, this_pc, "RANGE: conditional branch");
 
 	      ss->conditional_tick = ss->tick;
 	    }
@@ -2424,7 +2617,7 @@ run_scan (scan_state * ss, ulong start, ulong end)
 		einfo (FAIL, "failed to create new state");
 	      save_stack (ss);
 	      new_state->tick ++;
-	      run_scan (new_state, start, end);
+	      run_scan (new_state, start, end, filename);
 
 	      einfo (VERBOSE2, "restoring state to cond branch at %lx", this_pc);
 	      release_state (new_state);
@@ -2481,13 +2674,13 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	einfo (FAIL, "no handler for insn");
       if (! this_addr->insn->handler (ss, this_addr->insn, this_addr->args))
 	{
-	  einfo (WARN, "RESET: instruction simulation failed");
+	  einfo (WARN, "%s: RESET: instruction simulation failed", filename);
 	  break;
 	}
 
       if (emul_info.status == FALSE)
 	{
-	  einfo (WARN, "RESET: emulation stopped");
+	  einfo (VERBOSE2, "%s: RESET: emulation stopped", filename);
 	  break;
 	}
 
@@ -2495,14 +2688,14 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	{
 	  if (second_memory_access != -1)
 	    {
-	      display_insn (VERBOSE2, this_pc, "2nd speculative load");
+	      display_insn (VERBOSE2, this_pc, "2nd speculative instruction");
 	      /* We have found a sequence.  Tell the user.  */
-	      dump_sequence (ss, ss->tick);
+	      dump_sequence (ss, ss->tick, filename);
 	      ++ num_found;
 	      ss->conditional_tick = -1;
 	      break;
 	    }
-	  else if (first_memory_access != -1)
+	  else if (first_memory_access)
 	    {
 	      /* The attacker has now been able to load a register
 		 with a value from an address that they control.
@@ -2570,10 +2763,10 @@ x86_scan (bfd_byte * code, ulong size, ulong start, const char * filename, ulong
 
   num_found = 0;
 
-  run_scan (ss, start, end);
+  run_scan (ss, start, end, filename);
 
   if (num_found == 0)
-    einfo (INFO, "No sequences found");
+    einfo (INFO, "No sequences found", filename);
 
   release_state (ss);
   htab_delete (sequence_htab);
@@ -2586,21 +2779,24 @@ x86_scan (bfd_byte * code, ulong size, ulong start, const char * filename, ulong
 static bool
 x86_options (const char * arg, const char ** argv, unsigned argc)
 {
-  if (const_strneq (arg, "--num-branches="))
+#define NUM_BRANCHES "--num-branches="
+  if (const_strneq (arg, NUM_BRANCHES))
     {
-      max_num_branches = strtoul (arg + 15, NULL, 0);
+      max_num_branches = strtoul (arg + strlen (NUM_BRANCHES), NULL, 0);
       return TRUE;
     }
 
-  if (const_strneq (arg, "--start-address="))
+#define START_ADDRESS "--start-address="
+  if (const_strneq (arg, START_ADDRESS))
     {
-      start_address = strtoul (arg + 16, NULL, 0);
+      start_address = strtoul (arg + strlen (START_ADDRESS), NULL, 0);
       return TRUE;
     }
 
-  if (strneq (arg, "--syntax=", 9))
+#define SYNTAX "--syntax="
+  if (const_strneq (arg, SYNTAX))
     {
-      arg += 9;
+      arg += strlen (SYNTAX);
       if (streq (arg, "att"))
 	syntax = 1;
       else if (streq (arg, "intel"))
@@ -2619,8 +2815,8 @@ x86_options (const char * arg, const char ** argv, unsigned argc)
 static void
 x86_usage (void)
 {
-  einfo (INFO, "    --num-branches=<n>  [Set the maximum number of branches to follow]");
-  einfo (INFO, "    --start-address=<n> [Set the entry point of the scan]");
+  einfo (INFO, "    --num-branches=<N>  [Set the maximum number of branches to follow]");
+  einfo (INFO, "    --start-address=<N> [Set the entry point of the scan]");
   einfo (INFO, "    --syntax=[att|intel][Set the desired disassembly syntax]");
 }
 

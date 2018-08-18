@@ -25,10 +25,6 @@
 #define NUM_REGISTERS	32
 
 /* Values used to initialise registers.  */
-#define ATTACKER_REG_VAL	0x06eeeee0UL
-#define UNKNOWN_REG_VAL		0x11111100UL
-#define ATTACKER_MEM_VAL        0x00e0a0d0UL
-
 #define BREAKPOINT		0xd42000c0 	/* brk	#0x6 */
 
 #define ADDRESS_CHAR		'&'
@@ -40,6 +36,14 @@ typedef struct reg_move
   int    dest;
 } reg_move;
 
+typedef enum register_character
+{
+  REG_CHAR_NORMAL,		/* Just a normal register value.  */
+  REG_CHAR_POISONED,		/* A value possibly set by the attacker.  */
+  REG_CHAR_LOADED		/* A value loaded from a memory address chosen by the attacker.  */
+  
+} register_character;
+  
 typedef struct scan_state
 {
   ulong       pc;
@@ -47,10 +51,11 @@ typedef struct scan_state
   int         conditional_tick;
   ulong *     insns;
   uint        num_branches;
-  uint64_t    regs [NUM_REGISTERS];
   reg_move *  moves;
   uint        n_moves;
   int         next_move;
+  uint64_t    regs [NUM_REGISTERS];
+  register_character reg_char [NUM_REGISTERS];
 } scan_state;
 
 extern int print_insn_aarch64 (bfd_vma, struct disassemble_info *);
@@ -63,28 +68,53 @@ static char             print_buffer[256];
 static disassemble_info info = {0};
 static SIM_DESC         sd;
 static ulong            start_address = 0;
-static bool             first_memory_access = FALSE;
-static int              second_memory_access = -1;
-static int              attacker_reg_val_set = -1;
-static bool             attacker_reg_val_used = FALSE;
-static int              attacker_mem_val_used = -1;
 static bool             suppress_checks = FALSE;
 static int              reg_read = -1;
 static const char *     trace_arg = NULL;
 static int              poison_reg = -1;
 static uint             max_num_ticks = 1 << 12;
+static ulong            BEGIN; /* Start address of simulated memory.  */
+static ulong		END;   /* End address of simulated memory.  */
 
 /* --------Simulator Interceptor Functions ------------------------------------ */
+
+#define TICK_EVENT_CLEAR_ALL            (1 << 0)
+#define TICK_EVENT_MEM_VAL_ATTACKER_1   (1 << 1)
+#define TICK_EVENT_MEM_VAL_ATTACKER_4   (1 << 2)
+#define TICK_EVENT_DERIVED_VAL_USED     (1 << 3)
+#define TICK_EVENT_ATTACKER_VAL_USED    (1 << 4)
+#define TICK_EVENT_SPECTRE_ATTACK       (1 << 30)
+
+static uint tick_event;
+
+static uint
+this_tick (uint event)
+{
+  if (event == TICK_EVENT_CLEAR_ALL)
+    tick_event = 0;
+  else if (event)
+    tick_event |= event;
+
+  return tick_event;
+}
 
 static void
 reset_probes (void)
 {
-  attacker_reg_val_used = FALSE;
-  attacker_mem_val_used = -1;
-  attacker_reg_val_set = -1;
-  first_memory_access = FALSE;
-  second_memory_access = -1;
+  this_tick (TICK_EVENT_CLEAR_ALL);
+  
   reg_read = -1;
+}
+
+static void
+inc_write_count (uint64_t addr)
+{
+}
+
+static uint
+get_write_count (uint64_t addr)
+{
+  return 1;
 }
 
 static void
@@ -102,31 +132,165 @@ add_reg_move (scan_state * ss, int from, int to)
   ss->next_move ++;
 }
 
+static inline void
+set_register_character (GReg reg, register_character character)
+{
+  if (current_ss != NULL)
+    {
+      einfo (VERBOSE2, "set character of reg %d to %d", reg, character);
+      current_ss->reg_char[reg] = character;
+    }
+}
+
+static inline register_character
+get_register_character (GReg reg)
+{
+  if (current_ss == NULL)
+    return REG_CHAR_NORMAL;
+  return current_ss->reg_char[reg];
+}
+
+static void
+record_reg_set (GReg reg)
+{
+  if (suppress_checks)
+    return;
+
+einfo (VERBOSE2, "reg %d set, tick events: 0x%x", reg, this_tick (0));
+ set_register_character (reg, REG_CHAR_NORMAL);
+
+  if (this_tick (0) & TICK_EVENT_ATTACKER_VAL_USED)
+    set_register_character (reg, REG_CHAR_POISONED);
+
+  if (this_tick (0) & TICK_EVENT_DERIVED_VAL_USED)
+    set_register_character (reg, REG_CHAR_LOADED);
+
+  if (this_tick (0) & (TICK_EVENT_MEM_VAL_ATTACKER_1 | TICK_EVENT_MEM_VAL_ATTACKER_4))
+    {
+      einfo (VERBOSE2, "register %d set based on a value retrieved from an attacker controlled memory address", reg); 
+      set_register_character (reg, REG_CHAR_LOADED);
+    }
+
+  if (reg_read != -1)
+    add_reg_move (current_ss, reg_read, reg);			
+}
+
+static void
+record_reg_get (GReg reg)
+{
+  if (suppress_checks)
+    return;
+
+einfo (VERBOSE2, "reg %d read, character: %d", reg, get_register_character (reg));
+  switch (get_register_character (reg))
+    {
+    case REG_CHAR_POISONED:
+      einfo (VERBOSE2, "attacker controlled value in reg %d used", reg); 
+      (void) this_tick (TICK_EVENT_ATTACKER_VAL_USED);
+      break;
+
+    case REG_CHAR_LOADED:
+      einfo (VERBOSE2, "attacker memory value loaded into reg %d has been used", reg); 
+      (void) this_tick (TICK_EVENT_DERIVED_VAL_USED);
+      break;
+
+    default:
+      einfo (ERROR, "ICE: unknown register character"); 
+    case REG_CHAR_NORMAL:
+      break;
+    }
+
+  reg_read = reg;							
+}
+
+/* Makes a note of a memory read.  */
+
+static void
+record_memory_read (uint64_t addr)
+{
+  if (suppress_checks)
+    return;
+
+einfo (VERBOSE2, "mem addr %#lx read, tick events %x", addr, this_tick (0));
+  if (this_tick (0) & TICK_EVENT_DERIVED_VAL_USED)
+    {
+      /* The address from which we are reading could have been derived
+	 from a value previously read from another, attacker controlled,
+	 location.  This is a SPECTRE attack, loading a cache line that
+         can then be detected by the attacker.  */
+      if (variant & (VARIANT_1 | VARIANT_4))
+	{
+	  einfo (VERBOSE2, "second memory access detected (read)");
+	  (void) this_tick (TICK_EVENT_SPECTRE_ATTACK);
+	}
+      else
+	einfo (VERBOSE2, "second memory access detected (read) - ignored");
+    }
+
+  if (this_tick (0) & TICK_EVENT_ATTACKER_VAL_USED)
+    {
+      /* The address from which we are reading could have been set
+	 by the attacker.  */
+      einfo (VERBOSE2, "memory access detected (read)");
+
+      if ((variant & VARIANT_4) && get_write_count (addr) > 0)
+	/* We are loading from an address that previously written to.
+	   (Maybe with an attacker value, maybe not.  It does not matter).
+	   This can be the start of a variant 4 attack.
+
+	   FIXME: We should check the size of the access.  The read should
+	   be wider than the write...  */
+	(void) this_tick (TICK_EVENT_MEM_VAL_ATTACKER_4);
+
+      (void) this_tick (TICK_EVENT_MEM_VAL_ATTACKER_1);
+    }
+}
+
+static void
+record_memory_write (uint64_t addr)
+{
+  if (suppress_checks)
+    return;
+
+einfo (VERBOSE2, "mem addr %#lx written, tick events %x", addr, this_tick (0));
+  if (this_tick (0) & TICK_EVENT_DERIVED_VAL_USED)
+    {
+      /* If memory is being written to an address that might have
+	 been computed using a value that was read from a
+	 (different) attacker controlled address, then we presume
+	 that the attacker is forcing a specific line to be loaded
+	 into the data cache.  */
+      if (variant & VARIANT_7)
+	{	
+	  (void) this_tick (TICK_EVENT_SPECTRE_ATTACK);
+	  einfo (VERBOSE2, "second memory access detected (write)");
+	}
+      else
+	einfo (VERBOSE2, "second memory access detected (write) - ignored");
+    }
+
+  if (this_tick (0) & TICK_EVENT_ATTACKER_VAL_USED)
+    {
+      /* This is a write to an address chosen by the attacker.  */
+      einfo (VERBOSE2, "attacker controlled memory access detected (write)");
+
+      if (variant & VARIANT_4)
+	/* FIXME: We should record the width of the store.  */
+	inc_write_count (addr);
+    }
+
+  if (reg_read != -1)
+    add_reg_move (current_ss, reg_read, -2);
+}
+
 #define WRAP_REG_GET_FUNC(NAME,TYPE)					\
 TYPE									\
 __wrap_aarch64_get_reg_##NAME (sim_cpu * cpu, GReg reg, int r31_is_sp)	\
 {									\
   extern TYPE __real_aarch64_get_reg_##NAME (sim_cpu *, GReg, int);	\
-  TYPE val;								\
 									\
-  val = __real_aarch64_get_reg_##NAME (cpu, reg, r31_is_sp);		\
-  if (! suppress_checks)						\
-    {									\
-      /* Record when a register containing an				\
-	 attacker provided value is read.  */				\
-      if (val == ATTACKER_MEM_VAL)					\
-	{								\
-	  attacker_mem_val_used = reg;					\
-	  einfo (VERBOSE2, "attacker memory value loaded into reg %d has been used", reg); \
-	}								\
-      else if (val == ATTACKER_REG_VAL)					\
-	{								\
-	  attacker_reg_val_used = TRUE;					\
-	  einfo (VERBOSE2, "attacker controlled value in reg %d used", reg); \
-	}								\
-      reg_read = reg;							\
-    }									\
-  return val;								\
+  record_reg_get (reg);						\
+  return __real_aarch64_get_reg_##NAME (cpu, reg, r31_is_sp);		\
 }
 
 WRAP_REG_GET_FUNC (u64, uint64_t)
@@ -144,25 +308,7 @@ __wrap_aarch64_set_reg_##NAME (sim_cpu * cpu, GReg reg, int r31_is_sp, TYPE val)
 {									\
   extern void __real_aarch64_set_reg_##NAME (sim_cpu *, GReg, int, TYPE); \
 									\
-  if (! suppress_checks)						\
-    {									\
-      /* If the attacker value was read during this instruction, then	\
-	 always set the destination value to ATTACKER, no matter how	\
-	 it might have been transformed, so that we can track it.  */	\
-      if (attacker_reg_val_used)					\
-	{								\
-	  if (first_memory_access)					\
-	    {								\
-	      einfo (VERBOSE2, "register %d set based on a value retrieved from an attacker controlled memory address", reg); \
-	      attacker_reg_val_set = reg;				\
-	      val = ATTACKER_MEM_VAL;					\
-	    }								\
-	  else								\
-	    val = ATTACKER_REG_VAL;					\
-	}								\
-      if (reg_read != -1)						\
-	add_reg_move (current_ss, reg_read, reg);			\
-    }									\
+  record_reg_set (reg);							\
   									\
   __real_aarch64_set_reg_##NAME (cpu, reg, r31_is_sp, val);		\
 }
@@ -173,35 +319,13 @@ WRAP_REG_SET_FUNC (u32, uint32_t)
 WRAP_REG_SET_FUNC (s32, int32_t)
 /* There are no 16-bit or 8-bit register set functions.  */
 
-static ulong BEGIN;
-static ulong END;
-
 #define WRAP_MEM_GET_FUNC(NAME,TYPE)					\
 TYPE									\
 __wrap_aarch64_get_mem_##NAME (sim_cpu * cpu, uint64_t address)		\
 {									\
   extern TYPE __real_aarch64_get_mem_##NAME (sim_cpu *, uint64_t);	\
-									\
-  if (! suppress_checks)						\
-    {									\
-      if (attacker_mem_val_used != -1)					\
-	{								\
-	  /* If memory was accessed after an attacker controlled values \
-	     was read from a register, then we presume that the attacker\
-	     is forcing a specific line to loaded into the data cache.  */	\
-	  second_memory_access = attacker_mem_val_used;			\
-	  einfo (VERBOSE2, "second memory access detected");		\
-	}								\
-      else if (attacker_reg_val_used)					\
-	{								\
-	  /* If memory was accessed after an attacker provide value was	\
-	     read from a register, then we presume that the attacker is	\
-	     controlling this access.  */				\
-	  first_memory_access = TRUE;					\
-	  einfo (VERBOSE2, "first memory access detected");		\
-	  return (TYPE) ATTACKER_MEM_VAL;				\
-	}								\
-    } 									\
+  									\
+  record_memory_read (address);						\
 									\
   if (address >= BEGIN && address < END)				\
     return __real_aarch64_get_mem_##NAME (cpu, address);		\
@@ -230,13 +354,15 @@ __wrap_aarch64_set_mem_##NAME (sim_cpu * cpu, uint64_t address, TYPE val)	\
 {									\
   extern void __real_aarch64_set_mem_##NAME (sim_cpu *, uint64_t, TYPE);\
 									\
-  if (address >= BEGIN || address < END)				\
-    return __real_aarch64_set_mem_##NAME (cpu, address, val);		\
-									\
   if (address < aarch64_get_stack_start (cpu)				\
       && address >= aarch64_get_reg_u64 (cpu, 31, TRUE))		\
     return __real_aarch64_set_mem_##NAME (cpu, address, val);		\
-      									\
+									\
+  record_memory_write (address);					\
+									\
+  if (address >= BEGIN || address < END)				\
+    return __real_aarch64_set_mem_##NAME (cpu, address, val);		\
+									\
   if (! suppress_checks)						\
     einfo (VERBOSE2, "Treating memory write to unmapped address %#lx as OK", address); \
 }
@@ -324,15 +450,15 @@ scan_init (ulong pc)
      use them to pass values into the kernel.  */
   for (reg = 0; reg < NUM_REGISTERS; reg++)
     {
-      uint64_t val = reg < 8 ? ATTACKER_REG_VAL : UNKNOWN_REG_VAL;
+      set_register_character (reg, reg < 8 ? REG_CHAR_POISONED : REG_CHAR_NORMAL);
 
       /* Allow the user to specify a poisoned register on the command line.  */
       if (reg == poison_reg)
-	val = ATTACKER_REG_VAL;
+	set_register_character (reg, REG_CHAR_POISONED);
 
-      aarch64_set_reg_u64 (cpu, reg, 0, val);
-      aarch64_set_vec_u64 (cpu, reg, 0, val);
-      aarch64_set_vec_u64 (cpu, reg, 1, val);
+      aarch64_set_reg_u64 (cpu, reg, 0, 0);
+      aarch64_set_vec_u64 (cpu, reg, 0, 0);
+      aarch64_set_vec_u64 (cpu, reg, 1, 0);
     }
 
   aarch64_init (cpu, pc);
@@ -458,8 +584,11 @@ dump_tick (scan_state * ss, uint tick, uint move, int reg)
     {
       if (reg == ss->moves[move].dest)
 	{
-	  reg = ss->moves[move].source;      
-	  prefix = " LOAD:  ";
+	  reg = ss->moves[move].source;
+	  if (ss->moves[move].dest == -2)
+	    prefix = " STOR:  ";
+	  else
+	    prefix = " LOAD:  ";
 	}
 
       move --;
@@ -470,11 +599,12 @@ dump_tick (scan_state * ss, uint tick, uint move, int reg)
 }
 
 static void
-dump_sequence (scan_state * ss, ulong second_load)
+dump_sequence (scan_state * ss, ulong second_load, const char * filename)
 {
   int tick;
 
-  einfo (INFO, "Possible sequence found, based on a starting address of %#lx:", start_address);
+  einfo (INFO, "%s: Possible sequence found, based on a starting address of %#lx:",
+	 filename, start_address);
 
   if (BE_VERBOSE)
     for (tick = 0; tick < ss->conditional_tick; tick ++)
@@ -574,7 +704,7 @@ get_branch_dest (ulong addr)
 }
 
 static void
-run_scan (scan_state * ss, ulong start, ulong end)
+run_scan (scan_state * ss, ulong start, ulong end, const char * filename)
 {
   ulong      start_pc = ss->pc;
   jmp_buf    jumpbuf;
@@ -597,9 +727,12 @@ run_scan (scan_state * ss, ulong start, ulong end)
       print_insn_aarch64 (ss->pc, & info);
       
       if (is_breakpoint ())
-	/* We have already scanned forwards from this point.
-	   No need to continue.  */
-	break;
+	{
+	  display_insn (VERBOSE2, ss->pc, "breakpoint reached.  Current scan stopped.");
+	  /* We have already scanned forwards from this point.
+	     No need to continue.  */
+	  break;
+	}
 
       display_insn (VERBOSE2, ss->pc, "");
 
@@ -637,7 +770,7 @@ run_scan (scan_state * ss, ulong start, ulong end)
 	      new_state = clone_state (next, ss);
 	      new_state->tick ++;
 	      save_reg_state (ss);	      
-	      run_scan (new_state, start, end);
+	      run_scan (new_state, start, end, filename);
 	      einfo (VERBOSE2, "restoring state to cond branch at %lx", ss->pc);
 	      release_state (new_state);
 	      restore_reg_state (ss);
@@ -684,16 +817,16 @@ run_scan (scan_state * ss, ulong start, ulong end)
 
       if (ss->conditional_tick >= 0)
 	{
-	  if (second_memory_access != -1)
+	  if (this_tick (0) & TICK_EVENT_SPECTRE_ATTACK)
 	    {
 	      display_insn (VERBOSE2, ss->pc, "2nd speculative load");
 	      /* We have found a sequence.  Tell the user.  */
-	      dump_sequence (ss, ss->tick);
+	      dump_sequence (ss, ss->tick, filename);
 	      ++ num_found;
 	      ss->conditional_tick = -1;
 	      break;
 	    }
-	  else if (first_memory_access)
+	  else if (this_tick (0) & TICK_EVENT_MEM_VAL_ATTACKER_1)
 	    {
 	      /* The attacker has now been able to load a register
 		 with a value from an address that they control.
@@ -709,7 +842,7 @@ run_scan (scan_state * ss, ulong start, ulong end)
 
       if (next == ss->pc)
 	{
-	  display_insn (WARN, next, "unable to simulate insn - ignoring");
+	  display_insn (VERBOSE2, next, "unable to simulate insn - ignoring");
 	  next += 4;
 	}
       else if (next != ss->pc + 4)
@@ -783,7 +916,7 @@ bool
 aarch64_scan (bfd_byte *   code,
 	      ulong        size,
 	      ulong        start,
-	      const char * filename ATTRIBUTE_UNUSED,
+	      const char * filename,
 	      ulong        entry ATTRIBUTE_UNUSED)
 {
   scan_state * ss;
@@ -801,15 +934,15 @@ aarch64_scan (bfd_byte *   code,
 
   einfo (VERBOSE, "Scan for speculative loads starting from %lx", start_address);
 
+  current_ss = ss = clone_state (start_address, NULL);
+
   if (! scan_init (start_address))
     return FALSE;
 
-  ss = clone_state (start_address, NULL);
-  
-  run_scan (ss, start, end);
+  run_scan (ss, start, end, filename);
 
   if (num_found == 0)
-    einfo (INFO, "No sequences found starting from %#lx", start_address);
+    einfo (INFO, "%s: No sequences found starting from %#lx", filename, start_address);
 
   release_state (ss);
 
@@ -966,9 +1099,9 @@ aarch64_options (const char * arg, const char ** argv, unsigned argc)
 static void
 aarch64_usage (void)
 {
-  einfo (INFO, "    --num-branches=<n>  [Set the maximum number of branches to follow]");
-  einfo (INFO, "    --poison-reg=<n>    [Poison the contents of register <N>]");
-  einfo (INFO, "    --start-address=<n> [Set the entry point of the scan]");
+  einfo (INFO, "    --num-branches=<N>  [Set the maximum number of branches to follow]");
+  einfo (INFO, "    --poison-reg=<N>    [Poison the contents of register <N>]");
+  einfo (INFO, "    --start-address=<N> [Set the entry point of the scan]");
 }
 
 struct callbacks target = 

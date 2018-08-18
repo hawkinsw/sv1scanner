@@ -95,6 +95,8 @@ AARCH64_LDFLAGS += -L /path/to/gdb/build/libiberty
 
 # ---- You should not need to modify anything below here --------------
 
+TEST_DIR = ./tests
+
 HEADERS  = scanner.h memory.hpp
 
 # The AArch64 scanner has overrides for some of the AArch64
@@ -156,3 +158,66 @@ aarch64-scanner.o: aarch64-scanner.c $(HEADERS)
 
 aarch64-scanner: scanner.o aarch64-scanner.o
 	$(C++) $^ -o $@ $(LDFLAGS) $(AARCH64_LDFLAGS) $(AARCH64_LIBS) $(LIBS)
+
+
+x86_64-checks: x86_64-scanner
+	# These should *not* find results:
+	./x86_64-scanner \
+		$(TEST_DIR)/x86_64/not1.o \
+		$(TEST_DIR)/x86_64/not2.o \
+		$(TEST_DIR)/x86_64/not3.o \
+		$(TEST_DIR)/x86_64/not4.o \
+		$(TEST_DIR)/x86_64/not5.o \
+		$(TEST_DIR)/x86_64/not6.o \
+		$(TEST_DIR)/x86_64/not7.o \
+		$(TEST_DIR)/x86_64/not8.o \
+		$(TEST_DIR)/x86_64/not9.o \
+		$(TEST_DIR)/x86_64/not10.o 
+
+	# These should find results:
+	./x86_64-scanner --variant=1 \
+		$(TEST_DIR)/x86_64/v1.o \
+		$(TEST_DIR)/x86_64/v1s.o
+
+	# These should find results:
+	./x86_64-scanner --variant=4 \
+		$(TEST_DIR)/x86_64/v4l.o \
+		$(TEST_DIR)/x86_64/v4s.o
+
+	# These should find results:
+	./x86_64-scanner --variant=7 \
+		$(TEST_DIR)/x86_64/v7.o 
+
+	# These should find results:
+	./x86_64-scanner \
+		$(TEST_DIR)/x86_64/bug1.o \
+		$(TEST_DIR)/x86_64/bug2.o \
+		$(TEST_DIR)/x86_64/bug3.o \
+		$(TEST_DIR)/x86_64/bug4.o \
+		$(TEST_DIR)/x86_64/bug5.o
+
+aarch64-checks: aarch64-scanner
+	./aarch64-scanner \
+		$(TEST_DIR)/aarch64/not1.o \
+		$(TEST_DIR)/aarch64/not2.o \
+		$(TEST_DIR)/aarch64/not3.o \
+		$(TEST_DIR)/aarch64/not4.o \
+		$(TEST_DIR)/aarch64/not5.o \
+		$(TEST_DIR)/aarch64/not6.o \
+		$(TEST_DIR)/aarch64/not7.o 
+
+	./aarch64-scanner \
+		$(TEST_DIR)/aarch64/v1.o \
+		$(TEST_DIR)/aarch64/v4l.o \
+		$(TEST_DIR)/aarch64/v4s.o \
+		$(TEST_DIR)/aarch64/v7.o 
+
+	./aarch64-scanner \
+		$(TEST_DIR)/aarch64/bug1.o \
+		$(TEST_DIR)/aarch64/bug2.o \
+		$(TEST_DIR)/aarch64/bug3.o \
+		$(TEST_DIR)/aarch64/bug4.o \
+		$(TEST_DIR)/aarch64/bug5.o \
+		$(TEST_DIR)/aarch64/bug6.o \
+		$(TEST_DIR)/aarch64/bug7.o \
+		$(TEST_DIR)/aarch64/bug8.o 

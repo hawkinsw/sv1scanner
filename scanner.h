@@ -103,5 +103,10 @@ extern ulong             verbosity;           /* How informative we should be.  
 #define BE_VERBOSE      (verbosity > 0)
 #define BE_QUIET        (verbosity == -1UL)
 
+extern ulong             variant;
+#define VARIANT_1 (1 << 0)
+#define VARIANT_4 (1 << 1)
+#define VARIANT_7 (1 << 2)
+
 extern callbacks  target;          /* Target specific data structure. */
 

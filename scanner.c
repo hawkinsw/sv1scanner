@@ -1,7 +1,7 @@
 /* Scanner - a tool for locating SPECTRE vulnerabilities in binaries.
 
    Copyright (c) 2016 - 2018 Red Hat.
-   Version 1.1
+   Version 1.10
    Created by Nick Clifton.
 
   This is free software; you can redistribute it and/or modify it
@@ -15,8 +15,9 @@
   GNU General Public License for more details.  */
 
 #include "scanner.h"
+#include <dirent.h>
 
-static char * version = "1.1";
+static char * version = "1.10";
 
 /* Structure to hold information about an archive file.  */
 
@@ -57,6 +58,8 @@ static bool                 is_32bit;
 
 /* Variables set by command line options.  */
 ulong                verbosity = 0;
+ulong                variant = (VARIANT_1 | VARIANT_4 | VARIANT_7);
+
 static ulong         num_files = 0;
 static const char *  files[MAX_NUM_FILES];
 static bool          binary_blob = FALSE;
@@ -161,11 +164,16 @@ usage (void)
 {
   einfo (INFO, "Useage: %s [options] <file(s)>", target.scanner_name);
   einfo (INFO, " options:");
-  einfo (INFO, "          --binary      [Treat file(s) as binary blobs]");
-  einfo (INFO, "          --help        [Display this message]");
-  einfo (INFO, "          --quiet       [Do not print anything, just return a count of the number of problems found]");
-  einfo (INFO, "          --verbose     [Produce informational messages whilst working.  Repeat for more information]");
-  einfo (INFO, "          --version     [Report the verion of the tool]");
+  einfo (INFO, "    --binary            [Treat file(s) as binary blobs]");
+  einfo (INFO, "    --help              [Display this message]");
+  einfo (INFO, "    --quiet             [Do not print anything, just return a count of the number of problems found]");
+  einfo (INFO, "    --verbose           [Produce informational messages whilst working.  Repeat for more information]");
+  einfo (INFO, "    --version           [Report the verion of the tool]");
+  einfo (INFO, "    --variant=<N>       [Only look for the specified variant]");
+  einfo (INFO, "      Known variants:    1: SPEC - LOAD - [LOAD|STORE] (using addr computed from load)");
+  einfo (INFO, "                         4: SPEC - STORE+LOAD - LOAD/STORE (using wider second load/store)");
+  einfo (INFO, "                         7: CMP - SPEC - STORE - LOAD (from same addr as store)");
+  einfo (INFO, "                        -1: All of the above");
 
   if (target.usage)
     target.usage ();
@@ -213,6 +221,30 @@ process_command_line (uint argc, const char * argv[])
 		       || arg[1] == 0)
 		{
 		  verbosity ++;
+		  break;
+		}
+#define VARIANT "variant"
+	      else if (const_strneq (arg, VARIANT))
+		{
+		  unsigned long val;
+
+		  arg += strlen (VARIANT) + 1;
+		  val = strtoul (arg, NULL, 0);
+
+		  switch (val)
+		    {
+		    case 1: variant = VARIANT_1; break;
+		    case 4: variant = VARIANT_4; break;
+		    case 7: variant = VARIANT_7; break;
+		    case 0:
+		      if (streq (arg, "all"))
+			variant = VARIANT_1 | VARIANT_4 | VARIANT_7;
+		      else
+			einfo (ERROR, "unrecognised --variant value: %s", arg);
+		      break;
+		    default:
+		      einfo (ERROR, "unrecognised --variant value: %s", arg);
+		    }
 		  break;
 		}
 	      /* else Fall through.  */
@@ -1432,17 +1464,35 @@ process_file (const char * filename)
 	return einfo (SYS_WARN, "Could not locate '%s'", filename);
     }
 
+  if (S_ISDIR (statbuf.st_mode))
+    {
+      DIR * dir = opendir (filename);
+
+      if (dir == NULL)
+	return einfo (SYS_WARN, "unable to read directory: %s", filename);
+
+      struct dirent * entry;
+      bool result = TRUE;
+
+      einfo (VERBOSE, "Scanning directory: '%s'", filename);
+      while ((entry = readdir (dir)) != NULL)
+	{
+	  if (streq (entry->d_name, ".") || streq (entry->d_name, ".."))
+	    continue;
+
+	  /* FIXME: Memory leak...  */
+	  result &= process_file (concat (filename, "/", entry->d_name, NULL));
+	}
+
+      closedir (dir);
+      return result;
+    }
+
   if (! S_ISREG (statbuf.st_mode))
     return einfo (WARN, "'%s' is not an ordinary file", filename);
 
   if (statbuf.st_size < 0)
     return einfo (WARN, "'%s' has negative size, probably it is too large", filename);
-
-  if (S_ISDIR (statbuf.st_mode))
-    {
-      /* FIXME: recurse  */
-      return einfo (WARN, "%s is a directory - ignoring", filename);
-    }
 
   if ((file = fopen (filename, "rb")) == NULL)
     return einfo (WARN, "Input file '%s' is not readable", filename);
