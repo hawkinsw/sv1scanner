@@ -470,12 +470,17 @@ lex_reg_name (const char **pp)
 }
 
 static ulong
-read_reg (scan_state * ss, int reg)
+read_reg (scan_state * ss, int reg, RegisterValue *rv = nullptr)
 {
   ulong val;
-  RegisterValue reg_val;
-  ValueContents_t rval = RegisterValue::DefaultRegisterValue();
 
+  RegisterValue reg_val(reg, RegisterValue::DefaultRegisterValue());
+
+  if (rv != nullptr)
+    {
+      rv->SetValue(reg_val.GetValue());
+      rv->SetLocation(reg_val.GetLocation());
+    }
   if (reg < 0 || reg > NUM_REGISTERS)
     {
       einfo (FAIL, "BAD REG READ %d", reg);
@@ -483,15 +488,15 @@ read_reg (scan_state * ss, int reg)
     }
   
   val = ss->regs[reg];
- 
-  if (current_memory_space->GetRegisterValue(reg, reg_val)) 
-    {
-      rval = reg_val.GetValue();
-    }
+
+  current_memory_space->GetRegisterValue(reg_val);
+  if (rv)
+    current_memory_space->GetRegisterValue(*rv);
+
   if (! suppress_checks)						
     {
-      /* Record when a register containing an				
-	 attacker provided value is read.  */				
+      /* Record when a value containing an				
+	 attacker provided value is read into memory.*/
       if (val == ATTACKER_MEM_VAL)					
 	{								
 	  attacker_mem_val_used = reg;					
@@ -507,14 +512,20 @@ read_reg (scan_state * ss, int reg)
 	}
     }
 
-  assert(val == rval);
+  assert(val == reg_val.GetValue());
   return val;
 }
 
 static void
 write_reg (scan_state * ss, int reg, ulong val)
 {
-  RegisterValue reg_val;
+  RegisterValue reg_val(reg);
+
+  /*
+     Fetch the value first so that we retrieve
+     the register's metadata.
+   */
+  current_memory_space->GetRegisterValue(reg_val);
 
   if (reg < 0 || reg > NUM_REGISTERS)
     {
@@ -550,7 +561,6 @@ write_reg (scan_state * ss, int reg, ulong val)
 
   ss->regs[reg] = val;
 
-  reg_val.SetLocation(reg);
   reg_val.SetValue(val);
   current_memory_space->SetRegisterValue(reg_val);
 }
@@ -839,8 +849,9 @@ x86_read_mem (bfd_vma addr, bfd_byte * buffer, unsigned len, struct disassemble_
   return 0;
 }
 
-#define GET_REG_FROM_ARG(SS,ARG)       read_reg ((SS), (ARG).value)
-#define SET_REG_FROM_ARG(SS,ARG,VAL)  write_reg ((SS), (ARG).value, (VAL))
+#define GET_REG_FROM_ARG_VAL(SS, ARG, VAL)  read_reg ((SS), (ARG).value, (VAL))
+#define GET_REG_FROM_ARG(SS,ARG)            read_reg ((SS), (ARG).value)
+#define SET_REG_FROM_ARG(SS,ARG,VAL)        write_reg ((SS), (ARG).value, (VAL))
 
 static bool
 address_previously_stored (scan_state * ss, ulong addr)
@@ -855,13 +866,18 @@ address_previously_stored (scan_state * ss, ulong addr)
 }
 
 static ulong
-read_mem (scan_state * ss, ulong addr)
+read_mem (scan_state * ss, ulong addr, MemoryValue *rmv = nullptr)
 {
-  MemoryValue mv;
+  MemoryValue mv(addr);
   ulong * paddr = (ulong *) addr;
 
+  current_memory_space->GetMemoryValue(mv);
   if (paddr >= emul_info.stack && paddr < emul_info.stack + STACK_SIZE)
-    return * paddr;
+    {
+      if (rmv)
+	*rmv = mv;
+      return * paddr;
+    }
 
   if (! suppress_checks)
     {
@@ -898,7 +914,15 @@ read_mem (scan_state * ss, ulong addr)
 	{
 	  if (ss->conditional_tick != -1)
 	    {
-	      /* If memory is being accessed after an attacker provided value
+	      /*
+		 We are somewhere after a conditional instruction
+		 (we are probably in the midst of it, in fact) and
+		 we are reading using an attacker-controlled register,
+		 then we assume that we are being controlled?
+		 TODO: This seems naive.
+
+		 Original Comment:
+		 If memory is being accessed after an attacker provided value
 		 was read from a register, then we presume that the attacker is
 		 controlling this access.  */				
 	      first_memory_access = TRUE;
@@ -920,25 +944,32 @@ read_mem (scan_state * ss, ulong addr)
 
   einfo(VERBOSE2, "Reading from somewhere else (heap?) in memory: %llx.", addr);
 
-  if (current_memory_space->GetMemoryValue(addr, mv))
+  if (current_memory_space->GetMemoryValue(mv))
     {
       einfo(VERBOSE2, "GetMemoryValue(): Found existing value in memory.");
+      if (rmv)
+	*rmv = mv;
       return mv.GetValue();
     }
   einfo(VERBOSE2, "Returning the initializer.");
+  if (rmv)
+    *rmv = MemoryValue(addr, current_memory_space->GetInitializer());
   return current_memory_space->GetInitializer();
 }
 
 static void
-write_mem (scan_state * ss, ulong addr, ulong value)
+write_mem (scan_state * ss, ulong addr, ulong value, bool tainted = false)
 {
   ulong * paddr = (ulong *) addr;
+
+  MemoryValue output_value(addr, value, tainted);
 
   if (paddr >= emul_info.stack && paddr <= emul_info.stack + STACK_SIZE)
     {
       if (! suppress_checks)
 	einfo (VERBOSE2, "Value stored on stack at address %#lx", addr);
       * paddr = value;
+      current_memory_space->SetMemoryValue(output_value);
       return;
     }
 
@@ -982,6 +1013,7 @@ write_mem (scan_state * ss, ulong addr, ulong value)
     }	
 
   /* Note - we are not currently recording the actual values stored.  */
+  current_memory_space->SetMemoryValue(output_value);
 }
 
 static bool
@@ -1086,6 +1118,8 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
   ulong val;
   int amvu_arg1, amvu_arg2;
   int arvu_arg1, arvu_arg2;
+  RegisterValue rv;
+  MemoryValue mv;
 
   attacker_mem_val_used = -1;
   if (! parse_arg (ss, args, & args, & arg1, FALSE))
@@ -1123,7 +1157,10 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	{
 	case type_register:
 	  /* Register to register move.  */
-	  val = GET_REG_FROM_ARG (ss, arg1);
+	  val = GET_REG_FROM_ARG_VAL (ss, arg1, &rv);
+	  cout << "Converted rv (" << rv;
+	  rv = RegisterValue(arg2.value, rv.GetValue(), rv.GetTainted());
+	  cout << ") to rv (" << rv << ")." << endl;
 	  SET_REG_FROM_ARG (ss, arg2, val);
 	  return TRUE;
 
@@ -1131,7 +1168,9 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	  /* Load from memory.  */
 	  attacker_mem_val_used = amvu_arg1;
 	  attacker_reg_val_used = arvu_arg1;
-	  val = read_mem (ss, arg1.value);
+	  val = read_mem (ss, arg1.value, &mv);
+	  rv = RegisterValue(arg2.value, mv.GetValue(), mv.GetTainted());
+	  cout << "Converted mv (" << mv << ") to rv (" << rv << ")." << endl;
 	  SET_REG_FROM_ARG (ss, arg2, val);
 	  return TRUE;
 
@@ -1149,25 +1188,29 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
       switch (arg1.type)
 	{
 	case type_register:
-	  /* Store into memory.  */
-	  val = GET_REG_FROM_ARG (ss, arg1);
+	  /* Store into memory from register.  */
+	  val = GET_REG_FROM_ARG_VAL (ss, arg1, &rv);
+	  mv = MemoryValue(arg2.value, rv.GetValue(), rv.GetTainted());
+	  cout << "Converted rv (" << rv << ") to mv (" << mv << ")." << endl;
 	  /* Do not let the value read out of the register that is going
 	     to be written into memory, trigger a SPECTRE detection.
 	     See test x86_64/not5.S for an example.  */
 	  attacker_mem_val_used = amvu_arg2;
 	  attacker_reg_val_used = arvu_arg2;
-	  write_mem (ss, arg2.value, val);
+	  write_mem (ss, arg2.value, val, mv.GetTainted());
 	  return TRUE;
 
 	case type_address:
 	  /* Memory to memory copy.  */
 	  attacker_mem_val_used = amvu_arg1;
 	  attacker_reg_val_used = arvu_arg1;
-	  val = read_mem (ss, arg1.value);
-
+	  val = read_mem (ss, arg1.value, &mv);
+	  cout << "Converted mv (" << mv;
+	  mv = MemoryValue(arg2.value, rv.GetValue(), rv.GetTainted());
+	  cout << ") to mv (" << mv << ")." << endl;
 	  attacker_mem_val_used = amvu_arg2;
 	  attacker_reg_val_used = arvu_arg2;
-	  write_mem (ss, arg2.value, val);
+	  write_mem (ss, arg2.value, val, mv.GetTainted());
 	  return TRUE;
 
 	case type_constant:
@@ -2150,8 +2193,14 @@ scan_init (scan_state * ss, bfd_byte *code, ulong size, ulong start, ulong pc)
   static int param_regs [6] = { 7 /* rdi */, 6 /* rsi */, 2 /* rdx */, 1 /* rcx */, 8 /* r8 */, 9 /* r9 */ };
   int i;
   for (i = 0; i < ARRAY_SIZE (param_regs); i++)
-    write_reg (ss, param_regs[i], ATTACKER_REG_VAL);
+    {
+      
+      current_memory_space->SetRegisterValue(RegisterValue(param_regs[i],
+							   ATTACKER_REG_VAL,
+							   true));
+      write_reg (ss, param_regs[i], ATTACKER_REG_VAL);
 
+    }
   emul_info.status = TRUE;
   ss->pc = pc;
   write_reg (ss, SP_REGNO, (ulong)(emul_info.stack + (STACK_SIZE - 1)));
