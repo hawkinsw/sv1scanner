@@ -517,7 +517,7 @@ read_reg (scan_state * ss, int reg, RegisterValue *rv = nullptr)
 }
 
 static void
-write_reg (scan_state * ss, int reg, ulong val)
+write_reg (scan_state * ss, int reg, ulong val, bool tainted = false)
 {
   RegisterValue reg_val(reg);
 
@@ -533,7 +533,7 @@ write_reg (scan_state * ss, int reg, ulong val)
       return;
     }
 
-  if (! suppress_checks)						
+  if (! suppress_checks)
     {									
       if (reg == SP_REGNO)
 	/* SPECTRE attacks do not corrupt the stack.  */
@@ -562,6 +562,7 @@ write_reg (scan_state * ss, int reg, ulong val)
   ss->regs[reg] = val;
 
   reg_val.SetValue(val);
+  reg_val.SetTainted(reg_val.GetTainted()|tainted);
   current_memory_space->SetRegisterValue(reg_val);
 }
 
@@ -724,8 +725,10 @@ parse_mem_arg (scan_state * ss, const char * text, const char ** end, arg * arg,
       if (scale_register != -1)
 	scale_register_value = read_reg (ss, scale_register);
 
+      einfo(VERBOSE2, "addr_off: 0x%llx", addr_off);
       einfo(VERBOSE2, "base_register_value: 0x%llx", base_register_value);
       einfo(VERBOSE2, "scale_register_value: 0x%llx", scale_register_value);
+      einfo(VERBOSE2, "scale: 0x%llx", scale);
 
       arg->value = addr_off + base_register_value + scale_register_value*scale;
       return TRUE;
@@ -851,6 +854,7 @@ x86_read_mem (bfd_vma addr, bfd_byte * buffer, unsigned len, struct disassemble_
 
 #define GET_REG_FROM_ARG_VAL(SS, ARG, VAL)  read_reg ((SS), (ARG).value, (VAL))
 #define GET_REG_FROM_ARG(SS,ARG)            read_reg ((SS), (ARG).value)
+#define SET_REG_FROM_ARG_TAINT(SS,ARG,VAL,TAINT)        write_reg ((SS), (ARG).value, (VAL), TAINT)
 #define SET_REG_FROM_ARG(SS,ARG,VAL)        write_reg ((SS), (ARG).value, (VAL))
 
 static bool
@@ -927,6 +931,10 @@ read_mem (scan_state * ss, ulong addr, MemoryValue *rmv = nullptr)
 		 controlling this access.  */				
 	      first_memory_access = TRUE;
 	      einfo (VERBOSE2, "first memory access detected (read)");
+	      if (rmv)
+		{
+		  rmv->SetValue(ATTACKER_MEM_VAL);
+		}
 	      return (ulong) ATTACKER_MEM_VAL;
 	    }
 	}								
@@ -1161,7 +1169,7 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	  cout << "Converted rv (" << rv;
 	  rv = RegisterValue(arg2.value, rv.GetValue(), rv.GetTainted());
 	  cout << ") to rv (" << rv << ")." << endl;
-	  SET_REG_FROM_ARG (ss, arg2, val);
+	  SET_REG_FROM_ARG_TAINT (ss, arg2, val, rv.GetTainted());
 	  return TRUE;
 
 	case type_address:
@@ -1169,14 +1177,15 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	  attacker_mem_val_used = amvu_arg1;
 	  attacker_reg_val_used = arvu_arg1;
 	  val = read_mem (ss, arg1.value, &mv);
-	  rv = RegisterValue(arg2.value, mv.GetValue(), mv.GetTainted());
+	  rv = RegisterValue(arg2.value, mv.GetValue(), mv.GetTainted() |
+			                                val==ATTACKER_MEM_VAL);
 	  cout << "Converted mv (" << mv << ") to rv (" << rv << ")." << endl;
-	  SET_REG_FROM_ARG (ss, arg2, val);
+	  SET_REG_FROM_ARG_TAINT (ss, arg2, val, rv.GetTainted());
 	  return TRUE;
 
 	case type_constant:
 	  /* Store a constant into a register.  */
-	  SET_REG_FROM_ARG (ss, arg2, arg1.value);
+	  SET_REG_FROM_ARG_TAINT (ss, arg2, arg1.value, false);
 	  return TRUE;
 
 	default:
