@@ -470,17 +470,12 @@ lex_reg_name (const char **pp)
 }
 
 static ulong
-read_reg (scan_state * ss, int reg, RegisterValue *rv = nullptr)
+read_reg (scan_state * ss, int reg, RegisterValue &rv)
 {
   ulong val;
 
-  RegisterValue reg_val(reg, RegisterValue::DefaultRegisterValue());
+  rv = RegisterValue(reg, RegisterValue::DefaultRegisterValue());
 
-  if (rv != nullptr)
-    {
-      rv->SetValue(reg_val.GetValue());
-      rv->SetLocation(reg_val.GetLocation());
-    }
   if (reg < 0 || reg > NUM_REGISTERS)
     {
       einfo (FAIL, "BAD REG READ %d", reg);
@@ -488,10 +483,7 @@ read_reg (scan_state * ss, int reg, RegisterValue *rv = nullptr)
     }
   
   val = ss->regs[reg];
-
-  current_memory_space->GetRegisterValue(reg_val);
-  if (rv)
-    current_memory_space->GetRegisterValue(*rv);
+  current_memory_space->GetRegisterValue(rv);
 
   if (! suppress_checks)						
     {
@@ -512,20 +504,24 @@ read_reg (scan_state * ss, int reg, RegisterValue *rv = nullptr)
 	}
     }
 
-  assert(val == reg_val.GetValue());
+  assert(val == rv.GetValue());
   return val;
 }
 
+/*
+   Let's say we want to write a memory value to a register.
+ */
 static void
-write_reg (scan_state * ss, int reg, ulong val, bool tainted = false)
+write_reg (scan_state * ss, int reg, ulong val, const MemoryValue &mv)
 {
-  RegisterValue reg_val(reg);
+  write_reg(ss, reg, val, RegisterValue(reg, mv.GetValue(), mv.GetTainted()));
+}
 
-  /*
-     Fetch the value first so that we retrieve
-     the register's metadata.
-   */
-  current_memory_space->GetRegisterValue(reg_val);
+static void
+write_reg (scan_state * ss, int reg, ulong val, const RegisterValue &rv)
+{
+  assert(val == rv.GetValue());
+  assert(reg == rv.GetLocation());
 
   if (reg < 0 || reg > NUM_REGISTERS)
     {
@@ -560,9 +556,6 @@ write_reg (scan_state * ss, int reg, ulong val, bool tainted = false)
     }									
 
   ss->regs[reg] = val;
-
-  reg_val.SetValue(val);
-  reg_val.SetTainted(reg_val.GetTainted()|tainted);
   current_memory_space->SetRegisterValue(reg_val);
 }
 
@@ -852,10 +845,8 @@ x86_read_mem (bfd_vma addr, bfd_byte * buffer, unsigned len, struct disassemble_
   return 0;
 }
 
-#define GET_REG_FROM_ARG_VAL(SS, ARG, VAL)  read_reg ((SS), (ARG).value, (VAL))
-#define GET_REG_FROM_ARG(SS,ARG)            read_reg ((SS), (ARG).value)
-#define SET_REG_FROM_ARG_TAINT(SS,ARG,VAL,TAINT)        write_reg ((SS), (ARG).value, (VAL), TAINT)
-#define SET_REG_FROM_ARG(SS,ARG,VAL)        write_reg ((SS), (ARG).value, (VAL))
+#define GET_REG_FROM_ARG(SS,ARG, RV)            read_reg ((SS), (ARG).value, RV)
+#define SET_REG_FROM_ARG(SS,ARG,VAL,RV) write_reg ((SS), (ARG).value, (VAL), RV)
 
 static bool
 address_previously_stored (scan_state * ss, ulong addr)
@@ -870,16 +861,21 @@ address_previously_stored (scan_state * ss, ulong addr)
 }
 
 static ulong
-read_mem (scan_state * ss, ulong addr, MemoryValue *rmv = nullptr)
+read_mem (scan_state * ss, ulong addr, MemoryValue &mv)
 {
-  MemoryValue mv(addr);
   ulong * paddr = (ulong *) addr;
+
+  assert(addr == mv.GetLocation());
 
   current_memory_space->GetMemoryValue(mv);
   if (paddr >= emul_info.stack && paddr < emul_info.stack + STACK_SIZE)
     {
-      if (rmv)
-	*rmv = mv;
+      mv.SetValue(* paddr);
+      /*
+	 Update taint depending on whether the value on the stack
+	 is tainted or not.
+       */
+      mv.SetTainted(mv.GetTainted() | (* paddr) == ATTACKER_MEM_VAL);
       return * paddr;
     }
 
@@ -931,10 +927,7 @@ read_mem (scan_state * ss, ulong addr, MemoryValue *rmv = nullptr)
 		 controlling this access.  */				
 	      first_memory_access = TRUE;
 	      einfo (VERBOSE2, "first memory access detected (read)");
-	      if (rmv)
-		{
-		  rmv->SetValue(ATTACKER_MEM_VAL);
-		}
+	      mv->SetValue(ATTACKER_MEM_VAL);
 	      return (ulong) ATTACKER_MEM_VAL;
 	    }
 	}								
@@ -947,6 +940,9 @@ read_mem (scan_state * ss, ulong addr, MemoryValue *rmv = nullptr)
       einfo(VERBOSE2, "reading from program memory.");
 
       x86_read_mem (addr, (bfd_byte *) & val, sizeof (val), & info);
+      mv.SetValue(val);
+      mv.SetTainted(false);
+
       return val;
     }
 
@@ -955,29 +951,35 @@ read_mem (scan_state * ss, ulong addr, MemoryValue *rmv = nullptr)
   if (current_memory_space->GetMemoryValue(mv))
     {
       einfo(VERBOSE2, "GetMemoryValue(): Found existing value in memory.");
-      if (rmv)
-	*rmv = mv;
       return mv.GetValue();
     }
+
   einfo(VERBOSE2, "Returning the initializer.");
-  if (rmv)
-    *rmv = MemoryValue(addr, current_memory_space->GetInitializer());
-  return current_memory_space->GetInitializer();
+  mv = MemoryValue(addr, current_memory_space->GetInitializer(), false);
+  return mv.GetValue();
 }
 
 static void
-write_mem (scan_state * ss, ulong addr, ulong value, bool tainted = false)
+write_mem (scan_state * ss, ulong addr, ulong value, const RegisterValue &rv)
+{
+  write_mem(ss, addr, value, MemoryValue(addr, rv.GetValue(), rv.GetTainted()));
+}
+
+static void
+write_mem (scan_state * ss, ulong addr, ulong value, const MemoryValue &mv)
 {
   ulong * paddr = (ulong *) addr;
 
-  MemoryValue output_value(addr, value, tainted);
+  assert(val == mv.GetValue());
+  assert(addr == mv.GetLocation());
+
+  current_memory_space.SetMemoryValue(mv);
 
   if (paddr >= emul_info.stack && paddr <= emul_info.stack + STACK_SIZE)
     {
       if (! suppress_checks)
 	einfo (VERBOSE2, "Value stored on stack at address %#lx", addr);
       * paddr = value;
-      current_memory_space->SetMemoryValue(output_value);
       return;
     }
 
@@ -1019,9 +1021,6 @@ write_mem (scan_state * ss, ulong addr, ulong value, bool tainted = false)
 	    }
 	}
     }	
-
-  /* Note - we are not currently recording the actual values stored.  */
-  current_memory_space->SetMemoryValue(output_value);
 }
 
 static bool
@@ -1046,6 +1045,8 @@ static arg arg2;
 static bool
 handle_one_op (scan_state * ss, insn_info * info, const char * args)
 {
+  RegisterValue rv;
+  ulong val = 0;
   if (! parse_arg (ss, args, NULL, & arg1, TRUE))
     return handler_error (ss, "Failed to parse arg of unary type insn");
 
@@ -1055,25 +1056,30 @@ handle_one_op (scan_state * ss, insn_info * info, const char * args)
   switch (info->type)
     {
     case sc_unop_dec:
-      SET_REG_FROM_ARG (ss, arg1, GET_REG_FROM_ARG (ss, arg1) - 1);
+      val = (GET_REG_FROM_ARG (ss, arg1, rv) - 1);
+      rv.SetValue(val);
       break;
 
     case sc_unop_inc:
-      SET_REG_FROM_ARG (ss, arg1, GET_REG_FROM_ARG (ss, arg1) + 1);
+      val = (GET_REG_FROM_ARG (ss, arg1, rv) + 1);
+      rv.SetValue(val);
       break;
 
     case sc_unop_not:
-      SET_REG_FROM_ARG (ss, arg1, ~ GET_REG_FROM_ARG (ss, arg1));
+      val = (~ GET_REG_FROM_ARG (ss, arg1, rv));
+      rv.SetValue(val);
       break;
 
     case sc_unop_neg:
-      SET_REG_FROM_ARG (ss, arg1, - GET_REG_FROM_ARG (ss, arg1));
+      val = (- GET_REG_FROM_ARG (ss, arg1, rv));
+      rv.SetValue(val);
       break;
 
     default:
       return handler_error (ss, "unexpected unary op");
     }
 
+  SET_REG_FROM_ARG (ss, arg1, val, rv);
   return TRUE;
 }
 
@@ -1165,11 +1171,10 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	{
 	case type_register:
 	  /* Register to register move.  */
-	  val = GET_REG_FROM_ARG_VAL (ss, arg1, &rv);
-	  cout << "Converted rv (" << rv;
+	  rv.SetLocation(arg1.value);
+	  val = GET_REG_FROM_ARG (ss, arg1, rv);
 	  rv = RegisterValue(arg2.value, rv.GetValue(), rv.GetTainted());
-	  cout << ") to rv (" << rv << ")." << endl;
-	  SET_REG_FROM_ARG_TAINT (ss, arg2, val, rv.GetTainted());
+	  SET_REG_FROM_ARG (ss, arg2, val, rv);
 	  return TRUE;
 
 	case type_address:
@@ -1179,13 +1184,13 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	  val = read_mem (ss, arg1.value, &mv);
 	  rv = RegisterValue(arg2.value, mv.GetValue(), mv.GetTainted() |
 			                                val==ATTACKER_MEM_VAL);
-	  cout << "Converted mv (" << mv << ") to rv (" << rv << ")." << endl;
-	  SET_REG_FROM_ARG_TAINT (ss, arg2, val, rv.GetTainted());
+	  SET_REG_FROM_ARG (ss, arg2, val, rv);
 	  return TRUE;
 
 	case type_constant:
 	  /* Store a constant into a register.  */
-	  SET_REG_FROM_ARG_TAINT (ss, arg2, arg1.value, false);
+	  rv = RegisterValue(arg1.value, arg2, false);
+	  SET_REG_FROM_ARG_TAINT (ss, arg2, arg1.value, rv);
 	  return TRUE;
 
 	default:
@@ -1198,9 +1203,8 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	{
 	case type_register:
 	  /* Store into memory from register.  */
-	  val = GET_REG_FROM_ARG_VAL (ss, arg1, &rv);
+	  val = GET_REG_FROM_ARG_VAL (ss, arg1, rv);
 	  mv = MemoryValue(arg2.value, rv.GetValue(), rv.GetTainted());
-	  cout << "Converted rv (" << rv << ") to mv (" << mv << ")." << endl;
 	  /* Do not let the value read out of the register that is going
 	     to be written into memory, trigger a SPECTRE detection.
 	     See test x86_64/not5.S for an example.  */
@@ -1214,9 +1218,7 @@ handle_mov (scan_state * ss, insn_info * info, const char * args)
 	  attacker_mem_val_used = amvu_arg1;
 	  attacker_reg_val_used = arvu_arg1;
 	  val = read_mem (ss, arg1.value, &mv);
-	  cout << "Converted mv (" << mv;
-	  mv = MemoryValue(arg2.value, rv.GetValue(), rv.GetTainted());
-	  cout << ") to mv (" << mv << ")." << endl;
+	  mv = MemoryValue(arg2.value, mv.GetValue(), mv.GetTainted());
 	  attacker_mem_val_used = amvu_arg2;
 	  attacker_reg_val_used = arvu_arg2;
 	  write_mem (ss, arg2.value, val, mv.GetTainted());
@@ -1271,6 +1273,7 @@ static bool
 handle_xchg (scan_state * ss, insn_info * info, const char * args)
 {
   ulong tmp;
+  RegisterValue trv;
 
   if (   ! parse_arg (ss, args, & args, & arg1, FALSE)
       || ! parse_arg (ss, args, NULL,   & arg2, FALSE))
@@ -1281,34 +1284,79 @@ handle_xchg (scan_state * ss, insn_info * info, const char * args)
 
   if (arg1.type == type_register)
     {
-      tmp = GET_REG_FROM_ARG (ss, arg1);
-
       if (arg2.type == type_register)
 	{
-	  SET_REG_FROM_ARG (ss, arg1, GET_REG_FROM_ARG (ss, arg2));
-	  SET_REG_FROM_ARG (ss, arg2, tmp);
+	  /*
+	     Swapping two registers.
+	   */
+	  ulong r1val, r2val;
+	  RegisterValue r1, r2;
+	  r1.SetLocation(arg1.value);
+	  r2.SetLocation(arg2.value);
+
+	  r2val = GET_REG_FROM_ARG (ss, arg2, r2);
+	  r1val = GET_REG_FROM_ARG (ss, arg1, r1);
+
+	  SET_REG_FROM_ARG (ss, arg1, r2val, r2);
+	  SET_REG_FROM_ARG (ss, arg2, r1val, r1);
 	}
       else if (arg2.type == type_address)
 	{
-	  SET_REG_FROM_ARG (ss, arg1, read_mem (ss, arg2.value));
-	  write_mem (ss, arg2.value, tmp);
+	  /*
+	     Swapping a register with memory.
+	   */
+	  ulong r1val, m2val;
+	  RegisterValue r1;
+	  MemoryValue m2;
+
+	  r1.SetLocation(arg1.value);
+	  m2.SetLocation(arg2.value);
+
+	  r1val = GET_REG_FROM_ARG (ss, arg1, r1);
+	  m2val = read_mem (ss, arg2.value, m2);
+
+	  SET_REG_FROM_ARG (ss, arg1, m2val, m2);
+	  write_mem (ss, arg2.value, r1);
 	}
       else
 	return handler_error (ss, "unexpected type of 2nd arg of xchg");
     }
   else if (arg1.type == type_address)
     {
-      tmp = read_mem (ss, arg1.value);
-
       if (arg2.type == type_register)
 	{
-	  write_mem (ss, arg1.value, GET_REG_FROM_ARG (ss, arg2));
-	  SET_REG_FROM_ARG (ss, arg2, tmp);
+	  /*
+	     Address to register.
+	   */
+	  ulong m1val, r2val;
+	  MemoryValue m1;
+	  RegisterValue r2;
+
+	  m1.SetLocation(arg1.value);
+	  r2.SetLocation(arg2.value);
+
+	  m1val = read_mem (ss, arg1.value, m1);
+	  r2val = GET_REG_FROM_ARG (ss, arg2, r2);
+
+	  write_mem (ss, arg1.value, r2);
+	  SET_REG_FROM_ARG (ss, arg2, m1val, m1);
 	}
       else if (arg2.type == type_address)
 	{
-	  write_mem (ss, arg1.value, read_mem (ss, arg2.value));
-	  write_mem (ss, arg2.value, tmp);
+	  /*
+	     Address to address.
+	   */
+	  ulong m1val, m2val;
+	  MemoryValue m1, m2;
+
+	  m1.SetLocation(arg1.value);
+	  m2.SetLocation(arg2.value);
+
+	  m1val = read_mem (ss, arg1.value, m1);
+	  m2val = read_mem (ss, arg2.value, m2);
+
+	  write_mem (ss, arg1.value, m2val, m2);
+	  write_mem (ss, arg2.value, m1val, m1);
 	}
       else
 	return handler_error (ss, "unexpected type of 2nd arg of xchg");
@@ -1319,6 +1367,7 @@ handle_xchg (scan_state * ss, insn_info * info, const char * args)
   return TRUE;
 }
 
+#if 0
 static bool
 handle_cmpxchg (scan_state * ss, insn_info * info, const char * args)
 {
@@ -1364,14 +1413,17 @@ handle_cmpxchg (scan_state * ss, insn_info * info, const char * args)
   /* FIXME: Update other register ?  */
   return TRUE;
 }
+#endif
 
 #define DO_BINOP(SS,NAME,OP,AMVU_ARG1, ARVU_ARG1)		\
   do								\
     {								\
       if (arg2.type == type_register)				\
 	{							\
-	  ulong val;						\
-	  int reg = GET_REG_FROM_ARG (SS, arg2);		\
+	  ulong val1, val2;					\
+	  RegisterValue rv1, rv2;				\
+	  MemoryValue mv1, mv2;					\
+	  int reg = GET_REG_FROM_ARG (SS, arg2, rv2);		\
 								\
 	  switch (arg1.type)					\
 	    {							\
@@ -1379,16 +1431,21 @@ handle_cmpxchg (scan_state * ss, insn_info * info, const char * args)
 	      einfo (VERBOSE2, "uknown " #NAME " operation");	\
 	      break;						\
 	    case type_register:					\
-	      SET_REG_FROM_ARG (SS, arg2, reg OP GET_REG_FROM_ARG (SS, arg1)); \
+	      val1 = GET_REG_FROM_ARG (SS, arg1, rv1);		\
+	      rv1.SetLocation(arg2.value);			\
+	      rv1.SetValue(reg OP val1);			\
+	      SET_REG_FROM_ARG (SS, arg2, reg OP val1, rv1);	\
 	      break;						\
 	    case type_address:					\
 	      attacker_mem_val_used = AMVU_ARG1;		\
 	      attacker_reg_val_used = ARVU_ARG1;		\
-	      val = read_mem (SS, arg1.value);			\
-	      SET_REG_FROM_ARG (SS, arg2, reg OP val);		\
+	      val1 = read_mem (SS, arg1.value, mv1);		\
+	      mv1.SetValue(reg OP val1);			\
+	      SET_REG_FROM_ARG (SS, arg2, reg OP val1, mv1);	\
 	      break;						\
 	    case type_constant:					\
-	      SET_REG_FROM_ARG (SS, arg2, reg OP arg1.value);	\
+	      r1 = RegisterValue(arg2.value, reg OP arg1.value, false);\
+	      SET_REG_FROM_ARG (SS, arg2, reg OP arg1.value, r1);\
 	      break;						\
 	    default:						\
 	      /* FIXME */					\
@@ -1465,7 +1522,9 @@ handle_two_op (scan_state * ss, insn_info * info, const char * args)
       if (arg2.value != SP_REGNO)
 	{
 	  suppress_checks = TRUE;
-	  SET_REG_FROM_ARG (ss, arg2, arg1.value);
+	  SET_REG_FROM_ARG (ss, arg2, arg1.value, RegisterValue(arg2.value,
+								arg1.value,
+								false));
 	  suppress_checks = FALSE;
 	}
       break;
@@ -1531,14 +1590,24 @@ handle_shift (scan_state * ss, insn_info * info, const char * args)
 static bool
 handle_flow (scan_state * ss, insn_info * info, const char * args)
 {
+  RegisterValue old_sp, new_sp;
+  RegisterValue old_pc, new_pc;
+  ulong old_sp_val, new_sp_val;
+  ulong old_pc_val, new_pc_val;
+
   if (! parse_arg (ss, args, NULL, & arg1, TRUE))
     return handler_error (ss, "Failed to parse arg of flow constrol type insn");
 
   switch (info->type)
     {
     case sc_flow_call:
-      write_reg (ss, SP_REGNO, read_reg (ss, SP_REGNO) - sizeof (emul_info.stack[0]));
-      write_mem (ss, read_reg (ss, SP_REGNO), ss->pc);
+
+      old_sp_val = read_reg (ss, SP_REGNO, old_sp) ;
+      new_sp_val = old_sp_val - sizeof (emul_info.stack[0]);
+      new_sp = RegisterValue(SP_REGNO, new_sp_val, false);
+
+      write_reg (ss, SP_REGNO, new_sp_val, new_sp);
+      write_mem (ss, new_sp_val, ss->pc, MemoryValue(new_sp_val,ss->pc,false));
       /* Fall through.  */
     case sc_flow_loop: /* FIXME: assume always true for now.  */
     case sc_flow_condjmp: /* Conditional jumps - FIXME: assume always true for now.  */
@@ -1547,7 +1616,8 @@ handle_flow (scan_state * ss, insn_info * info, const char * args)
       switch (arg1.type)
 	{
 	case type_register:
-	  ss->pc = GET_REG_FROM_ARG (ss, arg1);
+	  old_pc = RegisterValue(arg1.value, 0, false);
+	  ss->pc = GET_REG_FROM_ARG (ss, arg1, old_pc);
 	  break;
 	case type_constant:
 	  ss->pc += info->len + arg1.value;
@@ -1570,18 +1640,37 @@ static bool
 handle_stack (scan_state * ss, insn_info * info, const char * args)
 {
   ulong saved_pc;
+  /*
+     stack pointer values.
+   */
+  RegisterValue old_sp(SP_REGNO), new_sp(SP_REGNO);
+  ulong old_sp_val, new_sp_val;
+  /*
+     values in memory at the stack pointer.
+   */
+  MemoryValue old_st, new_st;
+  ulong old_st_val, new_st_val;
 
   switch (info->type)
     {
     case sc_stack_ret:
       saved_pc = ss->pc;
-      ss->pc = read_mem (ss, read_reg (ss, SP_REGNO));
+      old_sp_val = read_reg (ss, SP_REGNO, old_sp);
+      new_sp = old_sp;
+      old_st.SetLocation(old_sp_val);
+      ss->pc = old_st_val = read_mem (ss, old_sp_val, old_st);
+      new_sp_val = old_sp_val + sizeof (emul_info.stack[0]);
+      new_sp.SetValue(new_sp_val);
+
+      //ss->pc = read_mem (ss, read_reg (ss, SP_REGNO));
       if (ss->pc < emul_info.code_base || ss->pc >= (emul_info.code_base + emul_info.size))
 	{
 	  einfo (VERBOSE, "POP without a PUSH ? at %#lx", saved_pc);
 	  emul_info.status = FALSE;
 	}
-      write_reg (ss, SP_REGNO, read_reg (ss, SP_REGNO) + sizeof (emul_info.stack[0]));
+      //write_reg (ss, SP_REGNO, read_reg (ss, SP_REGNO) + sizeof (emul_info.stack[0]));
+      write_reg (ss, SP_REGNO, new_sp_val, new_sp);
+
       if (parse_arg (ss, args, NULL, & arg1, TRUE))
 	{
 	  if (arg1.type == type_constant)
